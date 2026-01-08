@@ -1,0 +1,4 @@
+[commands]
+"Exam" = "C:/Users/mzqef/OneDrive/Projects/exam/run.bat"
+"AlexResearcher" = "python C:/Users/mzqef/OneDrive/Projects/OpenAlexResearcher/query.py"
+"Qwen3-4B" = "lemonade-server run Qwen3-4B-Hybrid --port 8020"

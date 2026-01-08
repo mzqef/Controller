@@ -1,0 +1,31 @@
+# Rust build
+/target/
+Cargo.lock
+
+# Ensure build-time copied config folders are ignored
+/target/**/config/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config and secrets
+.env
+config/*.secret.toml
+
+# Distribution
+*.tar.gz
+*.zip
+
+# Misc
+*.swp
+*.bak
+*.tmp
