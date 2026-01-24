@@ -3,6 +3,9 @@ use std::sync::mpsc;
 use anyhow::{Result, anyhow};
 use log::{info, error};
 use crate::core::clipboard::ClipboardManager;
+use crate::core::memory::MemoryEvent;
+use crate::core::memory_store::MemoryStore;
+use crate::core::memory::ActionType as MemActionType;
 use crate::api::client::LlmClient;
 use crate::ui::UiEvent;
 
@@ -19,6 +22,8 @@ pub struct ActionHandler {
     clipboard: Arc<ClipboardManager>,
     llm_client: Arc<LlmClient>,
     ui_tx: Option<mpsc::Sender<UiEvent>>,
+    graph_tx: Option<tokio::sync::mpsc::Sender<MemoryEvent>>,
+    memory_store: Option<Arc<MemoryStore>>,
 }
 
 impl ActionHandler {
@@ -26,11 +31,15 @@ impl ActionHandler {
         clipboard: Arc<ClipboardManager>,
         llm_client: Arc<LlmClient>,
         ui_tx: Option<mpsc::Sender<UiEvent>>,
+        graph_tx: Option<tokio::sync::mpsc::Sender<MemoryEvent>>,
+        memory_store: Option<Arc<MemoryStore>>,
     ) -> Self {
         Self {
             clipboard,
             llm_client,
             ui_tx,
+            graph_tx,
+            memory_store,
         }
     }
 
@@ -84,12 +93,36 @@ impl ActionHandler {
         if let Some(tx) = &self.ui_tx {
             match &result {
                 Ok(processed) => {
+                    // Store to mid-term memory
+                    if let Some(store) = &self.memory_store {
+                        let input_id = store.find_input_for_clipboard(&text);
+                        let action_type = match &action {
+                            Action::Format => MemActionType::Format,
+                            Action::TranslateE2C => MemActionType::TranslateE2C,
+                            Action::TranslateC2E => MemActionType::TranslateC2E,
+                            Action::Explain => MemActionType::Explain,
+                            Action::UserQuery(_) => MemActionType::UserQuery,
+                        };
+
+                        if let Some(graph_tx) = &self.graph_tx {
+                            let _ = graph_tx
+                                .send(MemoryEvent::AddActionResult {
+                                    input_text: text.clone(),
+                                    input_id,
+                                    output_text: processed.clone(),
+                                    action_type,
+                                })
+                                .await;
+                        } else {
+                            store.add_action_result(&text, input_id, processed.clone(), action_type);
+                        }
+                    }
+                    
                     // For user queries, don't modify clipboard - just show result
                     if !is_user_query {
                         // Update clipboard with result
-                        // Format: {Processed}\n\n{Original}
-                        let final_text = format!("{}\n\n{}", processed, text);
-                        if let Err(e) = self.clipboard.set_text(&final_text) {
+                        // Replace clipboard with processed output only
+                        if let Err(e) = self.clipboard.set_text_programmatic(processed) {
                             error!("Failed to write to clipboard: {}", e);
                         }
                     }

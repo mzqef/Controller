@@ -104,8 +104,8 @@ impl LlmClient {
     fn get_func_config(&self, functionality: &str) -> Option<&FunctionalityConfig> {
         match functionality {
             "copy_check" => Some(&self.config.copy_check),
-            "translate_e2c" => Some(&self.config.translate_e2c),
-            "translate_c2e" => Some(&self.config.translate_c2e),
+            "translate2c" => Some(&self.config.translate2c),
+            "translate2e" => Some(&self.config.translate2e),
             "explain" => Some(&self.config.explain),
             "user_query" => self.config.user_query.as_ref(),
             "visual" => self.config.visual.as_ref(),
@@ -280,10 +280,10 @@ impl LlmClient {
         // Determine functionality key based on languages
         let functionality = if (source.eq_ignore_ascii_case("English") || source.eq_ignore_ascii_case("en")) && 
                                (target.eq_ignore_ascii_case("Chinese") || target.eq_ignore_ascii_case("zh")) {
-            "translate_e2c"
+            "translate2c"
         } else if (source.eq_ignore_ascii_case("Chinese") || source.eq_ignore_ascii_case("zh")) && 
                   (target.eq_ignore_ascii_case("English") || target.eq_ignore_ascii_case("en")) {
-            "translate_c2e"
+            "translate2e"
         } else {
              // Fallback or generic - technically not supported by current detailed config structure rigidly, 
              // but we can default to one or fail. Let's try e2c structure as base or just fail.

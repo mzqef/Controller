@@ -9,14 +9,17 @@ use crate::core::config::{LlmConfig, CommandsConfig};
 use crate::core::events::AppEvent;
 use crate::core::actions::{Action, ActionHandler};
 use crate::core::clipboard_listener;
+use crate::core::graph_server;
+use crate::core::memory::MemoryEvent;
+use crate::core::memory_store::MemoryStore;
 use crate::api::client::LlmClient;
 use crate::ui::{MyApp, UiEvent, TrayHandler};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use log::{info, error, debug};
+use log::{info, error, debug, warn};
 use flexi_logger::{Logger, FileSpec, Criterion, Naming, Cleanup};
-use config::Config;
 use clap::Parser;
 use single_instance::SingleInstance;
 use rdev::{EventType, Key};
@@ -105,6 +108,7 @@ fn main() -> anyhow::Result<()> {
     // Channels
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let (tx, mut rx) = mpsc::channel::<AppEvent>(100);
+    let (graph_tx, graph_rx) = mpsc::channel::<MemoryEvent>(256);
 
     // Setup Tray
     let tray_menu = Menu::new();
@@ -136,7 +140,8 @@ fn main() -> anyhow::Result<()> {
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_tooltip("Controller")
+        .with_menu_on_left_click(false)
+        .with_tooltip("Controller - Left-click for Memory Graph")
         .with_icon(load_icon(60, 24, 22))
         .build()?;
 
@@ -154,6 +159,10 @@ fn main() -> anyhow::Result<()> {
 
     // Core Components
     let clipboard = Arc::new(ClipboardManager::new().expect("Failed to init clipboard"));
+    
+    // Memory Store
+    let memory_store = Arc::new(MemoryStore::new().expect("Failed to init memory store"));
+    
     // Use Mutex to allow mutation of LlmClient if we weren't using Arc. 
     // Since we are using Arc, we can't easily mutate.
     // However, we want to inject UI TX into LLM client for streaming.
@@ -174,14 +183,24 @@ fn main() -> anyhow::Result<()> {
     raw_llm_client.set_ui_tx(stream_tx);
     
     let llm_client = Arc::new(raw_llm_client);
-    let ui_tx_clone = ui_tx.clone();
     
     // Bridge Streaming Events to UI
     let bridge_tx = ui_tx.clone();
+    // UI event sender for non-streaming UI commands (e.g., show Memory Graph)
+    let ui_tx_for_events = ui_tx.clone();
+    
+    // Clone memory_store for the eframe closure (before it moves into tokio loop)
+    let memory_store_for_ui = memory_store.clone();
     
     // Health check must be spawned inside a runtime, so we defer it to the runtime block below
 
-    let action_handler = Arc::new(ActionHandler::new(clipboard.clone(), llm_client.clone(), Some(ui_tx.clone())));
+    let action_handler = Arc::new(ActionHandler::new(
+        clipboard.clone(),
+        llm_client.clone(),
+        Some(ui_tx.clone()),
+        Some(graph_tx.clone()),
+        Some(memory_store.clone()),
+    ));
 
     // Clipboard Listener
     let (cb_tx, mut cb_rx) = mpsc::channel(100);
@@ -190,30 +209,73 @@ fn main() -> anyhow::Result<()> {
     let last_copy_time = Arc::new(Mutex::new(std::time::Instant::now()));
     let last_copy_time_input = last_copy_time.clone();
 
+    // Diagnostics (used to correlate rare/IME-related issues)
+    let diag_start = Instant::now();
+    let diag_seq = Arc::new(AtomicU64::new(0));
+
     // Key Input Listener
     let tx_input = tx.clone();
+    let diag_seq_input = diag_seq.clone();
+    let diag_start_input = diag_start;
     std::thread::spawn(move || {
         let mut ctrl_pressed = false;
         
         let _ = rdev::listen(move |event| {
+            let diag_enabled = std::env::var_os("CONTROLLER_DIAG_KEYS").is_some();
+            let now_ms = diag_start_input.elapsed().as_millis();
+            let seq = diag_seq_input.fetch_add(1, Ordering::Relaxed) + 1;
+
+            if diag_enabled {
+                debug!(
+                    "[diag #{seq} @ {now_ms}ms] rdev event: type={:?} name={:?} time={:?}",
+                    event.event_type,
+                    event.name,
+                    event.time
+                );
+            }
+
             match event.event_type {
                 EventType::KeyPress(Key::ControlLeft) | EventType::KeyPress(Key::ControlRight) => ctrl_pressed = true,
                 EventType::KeyRelease(Key::ControlLeft) | EventType::KeyRelease(Key::ControlRight) => ctrl_pressed = false,
                 EventType::KeyPress(key) if ctrl_pressed => {
+                    // Heuristic: on Windows, IME composition may surface as an unknown key.
+                    // If this matches VK_PROCESSKEY (0xE5/229), avoid triggering hotkeys during composition.
+                    #[cfg(target_os = "windows")]
+                    if let Key::Unknown(raw) = key {
+                        const VK_PROCESSKEY: u32 = 0xE5;
+                        if raw == VK_PROCESSKEY {
+                            if diag_enabled {
+                                debug!("[diag #{seq} @ {now_ms}ms] IME composition suspected (Key::Unknown(VK_PROCESSKEY)); skipping hotkeys");
+                            }
+                            return;
+                        }
+                    }
+
                     // Check if copy happened recently (e.g. < 2s)
                     let check_elapsed = {
+                        let lock_start = Instant::now();
                         match last_copy_time_input.lock() {
-                            Ok(guard) => guard.elapsed() < Duration::from_millis(2000),
+                            Ok(guard) => {
+                                let lock_dur = lock_start.elapsed();
+                                if diag_enabled && lock_dur > Duration::from_millis(1) {
+                                    warn!("[diag #{seq} @ {now_ms}ms] last_copy_time lock took {:?}", lock_dur);
+                                }
+                                guard.elapsed() < Duration::from_millis(2000)
+                            }
                             Err(_) => false,
                         }
                     };
 
+                    if diag_enabled {
+                        debug!("[diag #{seq} @ {now_ms}ms] ctrl+{:?} check_elapsed={}", key, check_elapsed);
+                    }
+
                     if check_elapsed {
                         match key {
-                            Key::KeyR => { let _ = tx_input.blocking_send(AppEvent::TriggerAction(Action::Format)); },
-                            Key::KeyT => { let _ = tx_input.blocking_send(AppEvent::TriggerAction(Action::TranslateE2C)); },
-                            Key::KeyY => { let _ = tx_input.blocking_send(AppEvent::TriggerAction(Action::TranslateC2E)); },
-                            Key::KeyE => { let _ = tx_input.blocking_send(AppEvent::TriggerAction(Action::Explain)); },
+                            Key::KeyR => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::Format)); },
+                            Key::KeyT => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::TranslateE2C)); },
+                            Key::KeyY => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::TranslateC2E)); },
+                            Key::KeyE => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::Explain)); },
                             _ => {}
                         }
                     }
@@ -229,6 +291,9 @@ fn main() -> anyhow::Result<()> {
         rt.block_on(async move {
             info!("Event loop started");
             llm_client.spawn_health_check();
+
+            // Graph server task (receives MemoryEvent messages and updates MemoryStore)
+            tokio::spawn(graph_server::run(memory_store.clone(), graph_rx));
             
             // Bridge task for streaming
             tokio::spawn(async move {
@@ -240,11 +305,23 @@ fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     _ = cb_rx.recv() => {
-                        // Update timestamp
-                        if let Ok(mut guard) = last_copy_time.lock() {
-                            *guard = std::time::Instant::now();
+                        // Store clipboard content to memory (skip programmatic writes)
+                        if let Ok(text) = clipboard.get_text() {
+                            if clipboard.should_ignore_clipboard_text(&text) {
+                                if std::env::var_os("CONTROLLER_DIAG_CLIPBOARD").is_some() {
+                                    log::debug!("[diag] ignored programmatic clipboard write");
+                                }
+                            } else {
+                                // Update timestamp (used for hotkey gating)
+                                if let Ok(mut guard) = last_copy_time.lock() {
+                                    *guard = std::time::Instant::now();
+                                }
+                                let _ = graph_tx.try_send(MemoryEvent::AddClipboard(text));
+                            }
                         }
-                        debug!("Clipboard change detected");
+                        let now_ms = diag_start.elapsed().as_millis();
+                        let seq = diag_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                        debug!("[diag #{seq} @ {now_ms}ms] Clipboard change detected");
                     }
                     Some(event) = rx.recv() => {
                         debug!("Processing event: {:?}", event);
@@ -274,6 +351,9 @@ fn main() -> anyhow::Result<()> {
                                 // processor.set_enabled(enabled); // We removed processor
                                 info!("Processing enabled: {}", enabled);
                             },
+                            AppEvent::ShowMemoryGraph => {
+                                let _ = ui_tx_for_events.send(UiEvent::ShowMemoryGraph);
+                            }
                             _ => {}
                         }
                     }
@@ -283,13 +363,22 @@ fn main() -> anyhow::Result<()> {
     });
 
     // Start UI
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
+    let viewport = {
+        let builder = eframe::egui::ViewportBuilder::default()
             .with_visible(false) // Start hidden
             .with_taskbar(false)
             .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top(),
+            .with_transparent(true);
+
+        if std::env::var_os("CONTROLLER_NO_TOPMOST").is_some() {
+            builder
+        } else {
+            builder.with_always_on_top()
+        }
+    };
+
+    let options = eframe::NativeOptions {
+        viewport,
         ..Default::default()
     };
 
@@ -297,7 +386,7 @@ fn main() -> anyhow::Result<()> {
         "Controller",
         options,
         Box::new(move |cc| {
-            let app = MyApp::new(cc, ui_rx, tx.clone(), gui_ctx, tray_handler);
+            let app = MyApp::new(cc, ui_rx, tx.clone(), gui_ctx, tray_handler, memory_store_for_ui);
             Box::new(app)
         }),
     ).map_err(|e| anyhow::anyhow!("Eframe error: {}", e))

@@ -8,4 +8,5 @@ pub enum AppEvent {
     UserQuery(String),
     ToggleProcessing(bool),
     Cancel,
+    ShowMemoryGraph,
 }

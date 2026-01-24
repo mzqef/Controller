@@ -19,7 +19,7 @@ Controller is a Rust desktop agent that enhances clipboard workflows using LLMs.
 Note: Hotkeys only trigger if the copy event occurred recently (debounce ~2s). See `src/main.rs` for the exact timing logic.
 
 ## Configuration
-- Primary LLM configuration: `config/llm.toml` (per-function sections: `copy_check`, `translate_e2c`, `translate_c2e`, `explain`, `user_query`, etc.).
+- Primary LLM configuration: `config/llm.toml` (per-function sections: `copy_check`, `translate2c`, `translate2e`, `explain`, `user_query`, etc.).
 - Additional commands: `config/commands.toml` (tray custom commands).
 - Secrets: use `.env` or environment variables. Example:
 

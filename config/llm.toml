@@ -32,25 +32,25 @@ prompt = """Fix this PDF text:
 Return ONLY the fixed text. NO EXPLANATION."""
 
 # 2. Translate English to Chinese (Ctrl+T)
-[translate_e2c]
+[translate2c]
 api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 api_key = "${API_KEY}"
 model = "qwen-mt-flash"
 translation_options = { source_lang = "auto", target_lang = "Chinese" }
 
-[translate_e2c.local]
+[translate2c.local]
 api_url = "http://localhost:8000/api/v1/chat/completions"
 model = "Qwen3-4B-Hybrid"
 prompt = "Translate the following text to Chinese. NO EXPLANATION. Return ONLY the translation:\n\n"
 
 # 3. Translate Chinese to English (Ctrl+Y)
-[translate_c2e]
+[translate2e]
 api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 api_key = "${API_KEY}"
 model = "qwen-mt-flash"
 translation_options = { source_lang = "auto", target_lang = "English" }
 
-[translate_c2e.local]
+[translate2e.local]
 api_url = "http://localhost:8000/api/v1/chat/completions"
 model = "Qwen3-4B-Hybrid"
 prompt = "Translate the following text to English. NO EXPLANATION. Return ONLY the translation:\n\n"

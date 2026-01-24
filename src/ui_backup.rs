@@ -1,16 +1,11 @@
-pub mod memory_graph;
-
 use eframe::egui;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use log::info;
 use std::time::{Duration, Instant};
 use crate::core::events::AppEvent;
-use crate::core::memory_store::MemoryStore;
 use tokio::sync::mpsc::Sender;
 use tray_icon::menu::{MenuEvent, CheckMenuItem};
-use tray_icon::TrayIconEvent;
-use memory_graph::MemoryGraphView;
 
 pub struct TrayHandler {
     pub icon: tray_icon::TrayIcon,
@@ -31,7 +26,6 @@ pub enum UiEvent {
     StreamUpdate(String), // chunk
     StreamEnd(bool), // true = success, false = incomplete
     StreamError(String), // error message
-    ShowMemoryGraph,
     Quit,
 }
 
@@ -57,21 +51,10 @@ pub struct MyApp {
     state: AppState,
     tray_handler: Arc<Mutex<TrayHandler>>,
     last_type_time: Instant,
-    // Memory Graph
-    memory_store: Arc<MemoryStore>,
-    memory_graph_view: MemoryGraphView,
-    show_memory_graph: bool,
 }
 
 impl MyApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        rx: Receiver<UiEvent>,
-        app_tx: Sender<AppEvent>,
-        ctx_holder: Arc<Mutex<Option<egui::Context>>>,
-        tray_handler: Arc<Mutex<TrayHandler>>,
-        memory_store: Arc<MemoryStore>,
-    ) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, rx: Receiver<UiEvent>, app_tx: Sender<AppEvent>, ctx_holder: Arc<Mutex<Option<egui::Context>>>, tray_handler: Arc<Mutex<TrayHandler>>) -> Self {
         info!("MyApp initialized");
         // Share the context
         *ctx_holder.lock().unwrap() = Some(cc.egui_ctx.clone());
@@ -81,8 +64,6 @@ impl MyApp {
         
         // Apply Theme
         Self::apply_japanese_theme(&cc.egui_ctx);
-
-        let memory_graph_view = MemoryGraphView::new(memory_store.clone());
 
         Self {
             rx,
@@ -96,9 +77,6 @@ impl MyApp {
             state: AppState::Idle,
             tray_handler,
             last_type_time: Instant::now(),
-            memory_store,
-            memory_graph_view,
-            show_memory_graph: false,
         }
     }
 
@@ -222,22 +200,6 @@ impl eframe::App for MyApp {
             }
         }
 
-        // Handle tray icon left-click (opens Memory Graph)
-        if let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            match event {
-                TrayIconEvent::Click {
-                    button: tray_icon::MouseButton::Left,
-                    button_state: tray_icon::MouseButtonState::Up,
-                    ..
-                } => {
-                    info!("Tray left-click: opening Memory Graph");
-                    let _ = self.app_tx.try_send(AppEvent::ShowMemoryGraph);
-                    ctx.request_repaint();
-                }
-                _ => {}
-            }
-        }
-
         // Check for new events
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -340,10 +302,6 @@ impl eframe::App for MyApp {
                     self.needs_resize = true;
                     ctx.request_repaint();
                 }
-                UiEvent::ShowMemoryGraph => {
-                    self.show_memory_graph = true;
-                    ctx.request_repaint();
-                }
                 UiEvent::Quit => {
                     info!("UI received Quit event. Exiting...");
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -377,63 +335,6 @@ impl eframe::App for MyApp {
              ctx.request_repaint();
         }
 
-        // Memory Graph as separate native viewport (not affected by main window position)
-        if self.show_memory_graph {
-            let graph_viewport_id = egui::ViewportId::from_hash_of("memory_graph_viewport");
-            let graph_store = self.memory_store.clone();
-            
-            // We need to pass a mutable reference to the graph view, but show_viewport_immediate
-            // takes an FnOnce. So we'll swap it out temporarily.
-            let mut graph_view = std::mem::replace(
-                &mut self.memory_graph_view,
-                MemoryGraphView::new(graph_store.clone())
-            );
-            
-            let mut should_close = false;
-            let mut graph_panicked = false;
-            
-            ctx.show_viewport_immediate(
-                graph_viewport_id,
-                egui::ViewportBuilder::default()
-                    .with_title("🧠 Memory Graph")
-                    .with_inner_size([900.0, 700.0])
-                    .with_min_inner_size([400.0, 300.0]),
-                |ctx, _class| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            graph_view.draw(ui, ctx);
-                        }));
-                        if result.is_err() {
-                            log::error!("Memory Graph panicked; resetting graph view");
-                            graph_panicked = true;
-                            ui.colored_label(egui::Color32::RED, "Memory Graph crashed and was reset.");
-                        }
-                    });
-                    
-                    // Handle Escape to close Memory Graph
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        should_close = true;
-                    }
-                    
-                    // Handle window close button
-                    if ctx.input(|i| i.viewport().close_requested()) {
-                        should_close = true;
-                    }
-                },
-            );
-            
-            // Restore the graph view (reset after panic)
-            if graph_panicked {
-                self.memory_graph_view = MemoryGraphView::new(graph_store.clone());
-            } else {
-                self.memory_graph_view = graph_view;
-            }
-            
-            if should_close {
-                self.show_memory_graph = false;
-            }
-        }
-
         if !self.visible {
             // Move off-screen and keep loop alive
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([10000.0, 10000.0].into()));
@@ -442,8 +343,7 @@ impl eframe::App for MyApp {
             return;
         }
 
-        // Check focus status to auto-close the popup (AI result window).
-        // Memory Graph is a separate native viewport and should remain open.
+        // Check focus status to auto-close
         if self.visible {
             let should_close = if let Some(start) = self.focus_grace_period {
                 if start.elapsed() > Duration::from_millis(500) {
@@ -611,7 +511,7 @@ impl eframe::App for MyApp {
                 ui.add_space(5.0);
             });
 
-        // Close main UI on Escape (Memory Graph escape is handled earlier)
+        // Close on Escape
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.visible = false;
         }

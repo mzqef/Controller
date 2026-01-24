@@ -72,8 +72,8 @@ pub struct FunctionalityConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LlmConfig {
     pub copy_check: FunctionalityConfig,
-    pub translate_e2c: FunctionalityConfig,
-    pub translate_c2e: FunctionalityConfig,
+    pub translate2c: FunctionalityConfig,
+    pub translate2e: FunctionalityConfig,
     pub explain: FunctionalityConfig,
     pub user_query: Option<FunctionalityConfig>,
     #[allow(dead_code)]
