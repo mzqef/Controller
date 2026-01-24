@@ -1,7 +1,7 @@
 use crate::core::memory::*;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use log::info;
+use log::{info, debug, warn};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,7 +51,7 @@ impl MemoryStore {
     fn get_db_path() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir()
             .ok_or_else(|| anyhow!("Could not find local data directory"))?
-            .join("Controller");
+            .join("IntelliBoard");
 
         std::fs::create_dir_all(&data_dir)?;
         Ok(data_dir.join("memory.db"))
@@ -97,10 +97,10 @@ impl MemoryStore {
     fn load_from_db(&self) -> Result<()> {
         let conn = Connection::open(&self.db_path)?;
 
-        // Load items (MidTerm and LongTerm are persisted; ShortTerm is ephemeral)
+        // Load items (ShortTerm/MidTerm/LongTerm are persisted; ShortTerm is capped to max_short_term)
         let mut stmt = conn.prepare(
             "SELECT id, content, preview, memory_type, created_at, promoted_at, metadata, pos_x, pos_y, title 
-             FROM memory_items WHERE memory_type IN ('MidTerm', 'LongTerm')",
+             FROM memory_items WHERE memory_type IN ('ShortTerm', 'MidTerm', 'LongTerm')",
         )?;
 
         let items_iter = stmt.query_map([], |row| {
@@ -183,7 +183,32 @@ impl MemoryStore {
             );
         }
 
-        // Load edges for long-term items
+        // Enforce strict ShortTerm cap after loading from DB.
+        // We also delete trimmed IDs from SQLite so the DB doesn't grow unbounded.
+        let (removed_short_items, removed_short_edges) = self.trim_memory_type(&mut items, MemoryType::ShortTerm, self.max_short_term);
+        // Also enforce MidTerm cap on load
+        let (removed_mid_items, removed_mid_edges) = self.trim_memory_type(&mut items, MemoryType::MidTerm, self.max_mid_term);
+        drop(items);
+
+        // Delete trimmed items and edges from DB
+        if !removed_short_items.is_empty() {
+            info!("Trimmed {} ShortTerm items on load", removed_short_items.len());
+            let _ = self.delete_items_from_db(&removed_short_items);
+        }
+        if !removed_short_edges.is_empty() {
+            debug!("Removed {} orphan edges from ShortTerm trim", removed_short_edges.len());
+            let _ = self.delete_edges_from_db(&removed_short_edges);
+        }
+        if !removed_mid_items.is_empty() {
+            info!("Trimmed {} MidTerm items on load", removed_mid_items.len());
+            let _ = self.delete_items_from_db(&removed_mid_items);
+        }
+        if !removed_mid_edges.is_empty() {
+            debug!("Removed {} orphan edges from MidTerm trim", removed_mid_edges.len());
+            let _ = self.delete_edges_from_db(&removed_mid_edges);
+        }
+
+        // Load edges
         let mut stmt = conn.prepare(
             "SELECT id, source_id, target_id, relation, created_at FROM memory_edges",
         )?;
@@ -229,10 +254,26 @@ impl MemoryStore {
             );
         }
 
+        // Cleanup orphan edges (edges pointing to non-existent items)
+        let item_ids: std::collections::HashSet<Uuid> = self.items.read().unwrap().keys().copied().collect();
+        let orphan_edge_ids: Vec<Uuid> = edges
+            .iter()
+            .filter(|(_, e)| !item_ids.contains(&e.source_id) || !item_ids.contains(&e.target_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for eid in &orphan_edge_ids {
+            edges.remove(eid);
+        }
+        drop(edges);
+        if !orphan_edge_ids.is_empty() {
+            info!("Cleaned up {} orphan edges on startup", orphan_edge_ids.len());
+            let _ = self.delete_edges_from_db(&orphan_edge_ids);
+        }
+
         info!(
-            "Loaded {} long-term items and {} edges from database",
-            items.len(),
-            edges.len()
+            "Loaded {} items and {} edges from database",
+            self.items.read().map(|m| m.len()).unwrap_or(0),
+            self.edges.read().map(|m| m.len()).unwrap_or(0)
         );
         Ok(())
     }
@@ -258,12 +299,27 @@ impl MemoryStore {
 
         let item = MemoryItem::new_clipboard(content);
         let id = item.id;
+        debug!("Adding clipboard item {}", id);
 
-        let mut items = self.items.write().unwrap();
-        items.insert(id, item);
+        let (removed_item_ids, removed_edge_ids) = {
+            let mut items = self.items.write().unwrap();
+            items.insert(id, item);
+            // Trim old short-term items (strict latest-N stack)
+            self.trim_memory_type(&mut items, MemoryType::ShortTerm, self.max_short_term)
+        };
 
-        // Trim old short-term items
-        self.trim_memory_type(&mut items, MemoryType::ShortTerm, self.max_short_term);
+        // Persist ShortTerm item to SQLite
+        let _ = self.persist_item(id);
+
+        // Delete trimmed ShortTerm items and edges from DB so history remains capped across restarts.
+        if !removed_item_ids.is_empty() {
+            debug!("Trimmed {} ShortTerm items", removed_item_ids.len());
+            let _ = self.delete_items_from_db(&removed_item_ids);
+        }
+        if !removed_edge_ids.is_empty() {
+            debug!("Removed {} edges from ShortTerm trim", removed_edge_ids.len());
+            let _ = self.delete_edges_from_db(&removed_edge_ids);
+        }
 
         self.bump_revision();
         id
@@ -278,13 +334,24 @@ impl MemoryStore {
     ) -> (Uuid, Option<Uuid>) {
         let item = MemoryItem::new_action_result(output_text.clone(), action_type, input_id);
         let output_id = item.id;
+        debug!("Adding action result {} (type={:?}, input={:?})", output_id, action_type, input_id);
 
-        let mut items = self.items.write().unwrap();
-        items.insert(output_id, item);
+        let (removed_item_ids, removed_edge_ids) = {
+            let mut items = self.items.write().unwrap();
+            items.insert(output_id, item);
+            // Trim old mid-term items
+            self.trim_memory_type(&mut items, MemoryType::MidTerm, self.max_mid_term)
+        };
 
-        // Trim old mid-term items
-        self.trim_memory_type(&mut items, MemoryType::MidTerm, self.max_mid_term);
-        drop(items);
+        // Delete trimmed MidTerm items and edges from DB
+        if !removed_item_ids.is_empty() {
+            debug!("Trimmed {} MidTerm items", removed_item_ids.len());
+            let _ = self.delete_items_from_db(&removed_item_ids);
+        }
+        if !removed_edge_ids.is_empty() {
+            debug!("Removed {} edges from MidTerm trim", removed_edge_ids.len());
+            let _ = self.delete_edges_from_db(&removed_edge_ids);
+        }
 
         // Persist mid-term item to SQLite
         let _ = self.persist_item(output_id);
@@ -300,6 +367,8 @@ impl MemoryStore {
             let edge = MemoryEdge::new(in_id, output_id, relation);
             let eid = edge.id;
             self.edges.write().unwrap().insert(eid, edge);
+            // Persist edge so action-result relations survive restarts
+            let _ = self.persist_edge(eid);
             Some(eid)
         } else {
             None
@@ -309,30 +378,79 @@ impl MemoryStore {
         (output_id, edge_id)
     }
 
+    /// Trim items of a given type to max_count, removing oldest first.
+    /// Returns (removed_item_ids, removed_edge_ids) so callers can delete from DB.
     fn trim_memory_type(
         &self,
         items: &mut HashMap<Uuid, MemoryItem>,
         mem_type: MemoryType,
         max_count: usize,
-    ) {
+    ) -> (Vec<Uuid>, Vec<Uuid>) {
         let mut typed_items: Vec<_> = items
             .values()
             .filter(|i| i.memory_type == mem_type)
             .map(|i| (i.id, i.created_at))
             .collect();
 
+        let mut removed_item_ids = Vec::new();
+        let mut removed_edge_ids = Vec::new();
+
         if typed_items.len() > max_count {
             typed_items.sort_by_key(|(_, created)| *created);
             let to_remove = typed_items.len() - max_count;
+            debug!("Trimming {} {:?} items (have {}, max {})", to_remove, mem_type, typed_items.len(), max_count);
             for (id, _) in typed_items.into_iter().take(to_remove) {
                 items.remove(&id);
-                // Also remove related edges
-                self.edges
-                    .write()
-                    .unwrap()
-                    .retain(|_, e| e.source_id != id && e.target_id != id);
+                removed_item_ids.push(id);
+                // Also remove related edges and track their IDs for DB deletion
+                let mut edges = self.edges.write().unwrap();
+                let edge_ids_to_remove: Vec<Uuid> = edges
+                    .iter()
+                    .filter(|(_, e)| e.source_id == id || e.target_id == id)
+                    .map(|(eid, _)| *eid)
+                    .collect();
+                for eid in &edge_ids_to_remove {
+                    edges.remove(eid);
+                }
+                removed_edge_ids.extend(edge_ids_to_remove);
             }
         }
+
+        (removed_item_ids, removed_edge_ids)
+    }
+
+    fn delete_items_from_db(&self, item_ids: &[Uuid]) -> Result<()> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        debug!("Deleting {} items from DB", item_ids.len());
+        let mut conn = Connection::open(&self.db_path)?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM memory_items WHERE id = ?1")?;
+            for id in item_ids {
+                let _ = stmt.execute(params![id.to_string()]);
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn delete_edges_from_db(&self, edge_ids: &[Uuid]) -> Result<()> {
+        if edge_ids.is_empty() {
+            return Ok(());
+        }
+        debug!("Deleting {} edges from DB", edge_ids.len());
+        let mut conn = Connection::open(&self.db_path)?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM memory_edges WHERE id = ?1")?;
+            for id in edge_ids {
+                let _ = stmt.execute(params![id.to_string()]);
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Clone-promote: creates a NEW node in the destination tier with a PromotedFrom edge
@@ -346,7 +464,7 @@ impl MemoryStore {
         };
 
         // Create a new item in the destination tier
-        let mut new_item = MemoryItem {
+        let new_item = MemoryItem {
             id: Uuid::new_v4(),
             title: original.title.clone(),
             content: original.content.clone(),
@@ -381,9 +499,10 @@ impl MemoryStore {
 
         // Always persist PromotedFrom edges
         let _ = self.persist_edge(edge_id);
+        debug!("Created PromotedFrom edge {} ({} -> {})", edge_id, item_id, new_id);
 
         self.bump_revision();
-        info!("Clone-promoted item {} -> {} ({})", item_id, new_id, format!("{:?}", to_type));
+        info!("Clone-promoted item {} -> {} ({:?})", item_id, new_id, to_type);
         Ok(new_id)
     }
 
@@ -408,8 +527,14 @@ impl MemoryStore {
     }
 
     fn persist_item(&self, item_id: Uuid) -> Result<()> {
-        let items = self.items.read().unwrap();
-        let item = items
+        let items_guard = match self.items.read() {
+            Ok(g) => g,
+            Err(poison) => {
+                log::error!("MemoryStore.items read lock poisoned; recovering");
+                poison.into_inner()
+            }
+        };
+        let item = items_guard
             .get(&item_id)
             .ok_or_else(|| anyhow!("Item not found"))?;
 
@@ -468,27 +593,32 @@ impl MemoryStore {
 
         let edge = MemoryEdge::new(source_id, target_id, RelationType::UserLinked);
         let id = edge.id;
+        debug!("Adding user edge {} ({} -> {})", id, source_id, target_id);
         self.edges.write().unwrap().insert(id, edge);
+        // Persist user-created edges immediately
+        let _ = self.persist_edge(id);
         self.bump_revision();
         Some(id)
     }
 
     pub fn delete_item(&self, item_id: Uuid) -> Result<()> {
+        debug!("Deleting item {}", item_id);
         let mut items = self.items.write().unwrap();
         if let Some(item) = items.remove(&item_id) {
-            // Remove from DB if it was persisted (mid-term or long-term)
-            if item.memory_type == MemoryType::MidTerm || item.memory_type == MemoryType::LongTerm {
-                if let Ok(conn) = Connection::open(&self.db_path) {
-                    let _ = conn.execute(
-                        "DELETE FROM memory_items WHERE id = ?1",
-                        params![item_id.to_string()],
-                    );
-                }
+            // Remove from DB for all tiers (ShortTerm is now persisted too)
+            debug!("Removed {:?} item {} from memory", item.memory_type, item_id);
+            if let Ok(conn) = Connection::open(&self.db_path) {
+                let _ = conn.execute(
+                    "DELETE FROM memory_items WHERE id = ?1",
+                    params![item_id.to_string()],
+                );
             }
+        } else {
+            warn!("Attempted to delete non-existent item {}", item_id);
         }
         drop(items);
 
-        // Remove related edges
+        // Remove related edges from memory and DB
         let edge_ids: Vec<Uuid> = self.edges
             .read()
             .unwrap()
@@ -497,9 +627,15 @@ impl MemoryStore {
             .map(|(id, _)| *id)
             .collect();
 
-        let mut edges = self.edges.write().unwrap();
-        for eid in edge_ids {
-            edges.remove(&eid);
+        if !edge_ids.is_empty() {
+            debug!("Removing {} related edges for item {}", edge_ids.len(), item_id);
+            let mut edges = self.edges.write().unwrap();
+            for eid in &edge_ids {
+                edges.remove(eid);
+            }
+            drop(edges);
+            // Also delete edges from DB
+            let _ = self.delete_edges_from_db(&edge_ids);
         }
 
         self.bump_revision();
@@ -507,6 +643,7 @@ impl MemoryStore {
     }
 
     pub fn delete_edge(&self, edge_id: Uuid) {
+        debug!("Deleting edge {}", edge_id);
         self.edges.write().unwrap().remove(&edge_id);
         
         if let Ok(conn) = Connection::open(&self.db_path) {
@@ -549,32 +686,75 @@ impl MemoryStore {
     }
 
     pub fn get_item(&self, id: Uuid) -> Option<MemoryItem> {
-        self.items.read().unwrap().get(&id).cloned()
+        match self.items.read() {
+            Ok(g) => g.get(&id).cloned(),
+            Err(poison) => {
+                log::error!("MemoryStore.items read lock poisoned while get_item; recovering");
+                let g = poison.into_inner();
+                g.get(&id).cloned()
+            }
+        }
     }
 
     pub fn update_item_position(&self, id: Uuid, x: f32, y: f32) {
-        if let Some(item) = self.items.write().unwrap().get_mut(&id) {
-            item.position = Some((x, y));
-            // Persist position for mid/long-term items
-            if item.memory_type == MemoryType::MidTerm || item.memory_type == MemoryType::LongTerm {
-                let _ = self.persist_item(id);
-            }
-        }
-        self.bump_revision();
-    }
-
-    /// Update an item's title. Persists for mid/long-term items.
-    pub fn update_item_title(&self, id: Uuid, title: String) {
         let mut should_persist = false;
         {
-            let mut items = self.items.write().unwrap();
-            if let Some(item) = items.get_mut(&id) {
-                item.title = if title.trim().is_empty() { None } else { Some(title) };
+            // Acquire write lock, recovering from poison if necessary
+            let mut items_guard = match self.items.write() {
+                Ok(g) => g,
+                Err(poison) => {
+                    log::error!("MemoryStore.items write lock poisoned; recovering");
+                    poison.into_inner()
+                }
+            };
+            if let Some(item) = items_guard.get_mut(&id) {
+                item.position = Some((x, y));
                 should_persist = item.memory_type == MemoryType::MidTerm || item.memory_type == MemoryType::LongTerm;
             }
         }
         if should_persist {
             let _ = self.persist_item(id);
+        }
+        self.bump_revision();
+    }
+
+    /// Clear all stored positions (for Auto Align feature)
+    pub fn clear_all_positions(&self) -> Result<()> {
+        // Clear in-memory positions
+        {
+            let mut items = self.items.write().unwrap();
+            for item in items.values_mut() {
+                item.position = None;
+            }
+        }
+        // Clear positions in database
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute("UPDATE memory_items SET pos_x = NULL, pos_y = NULL", [])?;
+        self.bump_revision();
+        info!("Cleared all item positions");
+        Ok(())
+    }
+
+    /// Update an item's title. Persists to SQLite for all item types.
+    pub fn update_item_title(&self, id: Uuid, title: String) {
+        let item_exists = {
+            let mut items = self.items.write().unwrap();
+            if let Some(item) = items.get_mut(&id) {
+                let new_title = if title.trim().is_empty() { None } else { Some(title.clone()) };
+                info!("Updating title for item {}: {:?} -> {:?}", id, item.title, new_title);
+                item.title = new_title;
+                true
+            } else {
+                warn!("update_item_title: item {} not found", id);
+                false
+            }
+        };
+        if item_exists {
+            if let Err(e) = self.persist_item(id) {
+                log::error!("Failed to persist item {} after title update: {}", id, e);
+            } else {
+                debug!("Successfully persisted title update for item {}", id);
+            }
         }
         self.bump_revision();
     }
@@ -607,13 +787,13 @@ impl MemoryStore {
         typed_items.into_iter().skip(offset).take(limit).collect()
     }
 
-    /// Get edges where at least one endpoint is in the given set of item IDs
+    /// Get edges where BOTH endpoints are in the given set of item IDs
     pub fn list_edges_for_items(&self, item_ids: &std::collections::HashSet<Uuid>) -> Vec<MemoryEdge> {
         self.edges
             .read()
             .unwrap()
             .values()
-            .filter(|e| item_ids.contains(&e.source_id) || item_ids.contains(&e.target_id))
+            .filter(|e| item_ids.contains(&e.source_id) && item_ids.contains(&e.target_id))
             .cloned()
             .collect()
     }

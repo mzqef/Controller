@@ -16,7 +16,7 @@ impl ClipboardHandler for Listener {
     fn on_clipboard_change(&mut self) -> CallbackResult {
         // Avoid blocking in the clipboard callback thread.
         let _ = self.sender.try_send(());
-        if std::env::var_os("CONTROLLER_DIAG_CLIPBOARD").is_some() {
+        if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
             log::debug!("[diag] clipboard_master reported clipboard change");
         }
         CallbackResult::Next

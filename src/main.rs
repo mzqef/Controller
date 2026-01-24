@@ -1,32 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod core;
-mod api;
-mod ui;
 
-use crate::core::clipboard::ClipboardManager;
-use crate::core::config::{LlmConfig, CommandsConfig};
-use crate::core::events::AppEvent;
-use crate::core::actions::{Action, ActionHandler};
-use crate::core::clipboard_listener;
-use crate::core::graph_server;
-use crate::core::memory::MemoryEvent;
-use crate::core::memory_store::MemoryStore;
-use crate::api::client::LlmClient;
-use crate::ui::{MyApp, UiEvent, TrayHandler};
+use IntelliBoard::core::clipboard::ClipboardManager;
+use IntelliBoard::core::config::{ActionsConfig, CommandsConfig};
+use IntelliBoard::core::config_watcher::{ConfigWatcher, ConfigChange};
+use IntelliBoard::core::events::AppEvent;
+use IntelliBoard::core::actions::{Action, ActionHandler};
+use IntelliBoard::core::clipboard_listener;
+use IntelliBoard::core::graph_server;
+use IntelliBoard::core::memory::MemoryEvent;
+use IntelliBoard::core::memory_store::MemoryStore;
+use IntelliBoard::core::ipc_server::GraphIpcServer;
+use IntelliBoard::core::process_manager::ProcessManager;
+use IntelliBoard::api::client::LlmClient;
+use IntelliBoard::ui::{MyApp, UiEvent, TrayHandler};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
-use log::{info, error, debug, warn};
+use log::{info, error, debug};
 use flexi_logger::{Logger, FileSpec, Criterion, Naming, Cleanup};
 use clap::Parser;
 use single_instance::SingleInstance;
-use rdev::{EventType, Key};
 use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem, CheckMenuItem, PredefinedMenuItem}};
 
 #[derive(Parser, Debug)]
-#[command(name = "controller")]
+#[command(name = "IntelliBoard")]
 struct Opt {
     #[arg(short, long)]
     config: Option<String>,
@@ -38,35 +37,23 @@ struct Opt {
     log: bool,
 }
 
-pub fn load_icon(r: u8, g: u8, b: u8) -> tray_icon::Icon {
-    let width = 32;
-    let height = 32;
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for _ in 0..height {
-        for _ in 0..width {
-            rgba.extend_from_slice(&[r, g, b, 255]);
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, width, height).expect("Failed to create icon")
-}
-
 fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
 
-    let instance = SingleInstance::new("controller_app").map_err(|e| anyhow::anyhow!("Failed to check single instance: {}", e))?;
+    let instance = SingleInstance::new("IntelliBoard_app").map_err(|e| anyhow::anyhow!("Failed to check single instance: {}", e))?;
     if !instance.is_single() {
         if opt.log {
             // Log checking logic omitted for brevity, assuming user knows how to check logs
-            println!("Controller is already running.");
+            println!("IntelliBoard is already running.");
             return Ok(());
         } else {
-            eprintln!("Controller is already running.");
+            eprintln!("IntelliBoard is already running.");
             return Ok(());
         }
     }
 
     Logger::try_with_str("info")?
-        .log_to_file(FileSpec::default().directory("logs").basename("controller"))
+        .log_to_file(FileSpec::default().directory("logs").basename("IntelliBoard"))
         .write_mode(flexi_logger::WriteMode::Direct)
         .format(flexi_logger::opt_format)
         .rotate(Criterion::Size(10 * 1024 * 1024), Naming::Timestamps, Cleanup::KeepLogFiles(3))
@@ -76,7 +63,7 @@ fn main() -> anyhow::Result<()> {
         error!("Panic occurred: {:?}", info);
     }));
 
-    info!("Starting Controller...");
+    info!("Starting IntelliBoard...");
     
     // Load .env file if present
     match dotenv::dotenv() {
@@ -91,29 +78,70 @@ fn main() -> anyhow::Result<()> {
         log::warn!("API_KEY not found in environment. Remote features may fail.");
     }
     
-    // Load LLM and commands configuration using overlay loader (repo defaults + XDG overrides)
-    let llm_config: LlmConfig = match crate::core::config::load_llm_config() {
+    // Load Actions configuration (replaces LLM config with dynamic actions)
+    let actions_config: ActionsConfig = match IntelliBoard::core::config::load_actions_config() {
         Ok(cfg) => cfg,
-        Err(e) => return Err(anyhow::anyhow!("Failed to load llm config: {}", e)),
+        Err(e) => {
+            log::warn!("Failed to load actions config: {}, using defaults", e);
+            ActionsConfig::default()
+        }
     };
 
-    let cmd_config: Option<CommandsConfig> = match crate::core::config::load_commands_config() {
+    let cmd_config: Option<CommandsConfig> = match IntelliBoard::core::config::load_commands_config() {
         Ok(cfg) => cfg,
         Err(e) => {
             log::warn!("Failed to load commands config: {}", e);
             None
         }
     };
+    
+    let hotkeys_config = match IntelliBoard::core::config::load_hotkeys_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            log::warn!("Failed to load hotkeys config: {}", e);
+            IntelliBoard::core::config::HotkeysConfig::default()
+        }
+    };
+    
+    // Wrap hotkeys in Arc<RwLock> for hot-reload support
+    let shared_hotkeys = std::sync::Arc::new(std::sync::RwLock::new(hotkeys_config));
+    
+    // Wrap actions config in Arc<RwLock> for hot-reload
+    let shared_actions = std::sync::Arc::new(std::sync::RwLock::new(actions_config.clone()));
 
     // Channels
-    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+    let (ui_tx, ui_rx) = flume::unbounded::<UiEvent>();
     let (tx, mut rx) = mpsc::channel::<AppEvent>(100);
     let (graph_tx, graph_rx) = mpsc::channel::<MemoryEvent>(256);
+    
+    // Config watcher for hot-reload
+    let config_watcher = match ConfigWatcher::new("config") {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("Failed to start config watcher: {}", e);
+            None
+        }
+    };
+    
+    // Forward config changes to main event loop
+    if let Some(watcher) = config_watcher {
+        let tx_config = tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                if let Some(change) = watcher.try_recv() {
+                    let _ = tx_config.blocking_send(AppEvent::ConfigChanged(change));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
 
     // Setup Tray
     let tray_menu = Menu::new();
     let show_log_i = MenuItem::new("Show Log", true, None);
     let show_log_id = show_log_i.id().clone();
+    let hotkey_config_i = MenuItem::new("Configuration", true, None);
+    let hotkey_config_id = hotkey_config_i.id().clone();
     let enable_i = CheckMenuItem::new("Enable Processing", true, true, None);
     let enable_id = enable_i.id().clone();
     let exit_i = MenuItem::new("Exit", true, None);
@@ -135,14 +163,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     tray_menu.append(&show_log_i).unwrap();
+    tray_menu.append(&hotkey_config_i).unwrap();
     tray_menu.append(&enable_i).unwrap();
     tray_menu.append(&exit_i).unwrap();
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_menu_on_left_click(false)
-        .with_tooltip("Controller - Left-click for Memory Graph")
-        .with_icon(load_icon(60, 24, 22))
+        .with_tooltip("IntelliBoard - Left-click for Memory Graph")
+        .with_icon(IntelliBoard::load_tray_icon_active())
         .build()?;
 
     let tray_handler = Arc::new(Mutex::new(TrayHandler {
@@ -150,6 +179,7 @@ fn main() -> anyhow::Result<()> {
         enable_item: enable_i,
         enable_id,
         show_log_id,
+        hotkey_config_id,
         exit_id,
         tx: tx.clone(),
         custom_commands: custom_commands_map,
@@ -163,6 +193,9 @@ fn main() -> anyhow::Result<()> {
     // Memory Store
     let memory_store = Arc::new(MemoryStore::new().expect("Failed to init memory store"));
     
+    // Process Manager for child windows
+    let process_manager = Arc::new(ProcessManager::new());
+    
     // Use Mutex to allow mutation of LlmClient if we weren't using Arc. 
     // Since we are using Arc, we can't easily mutate.
     // However, we want to inject UI TX into LLM client for streaming.
@@ -171,28 +204,21 @@ fn main() -> anyhow::Result<()> {
     // We need to pass the tx to the client. But the tx is created here.
     // We'll wrap LlmClient in Arc<Mutex<>> or just configure it before wrapping in Arc if possible.
     // Actually, simpler: construct client with ui_tx option.
-    let mut raw_llm_client = LlmClient::new(llm_config.clone());
-    // We need to convert std::sync::mpsc to tokio::sync::mpsc if client wants that?
-    // Client wants tokio::sync::mpsc for async. But ui_tx is std::sync::mpsc::channel from main.
-    // wait, UI rx is std::mpsc. egui needs std/winit event loop compatibility usually.
-    // But async tasks want tokio channel.
-    // We need a bridge or just use tokio channel for UI events if possible, OR keep std channel and have blocking send?
-    // Blocking send in async code is bad.
-    // Solution: Create a specific tokio channel for streaming updates, and a bridge task.
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<UiEvent>(100);
-    raw_llm_client.set_ui_tx(stream_tx);
+    let mut raw_llm_client = LlmClient::new(actions_config.clone());
+    // Use flume channel - works in both sync and async contexts
+    raw_llm_client.set_ui_tx(ui_tx.clone());
+    
+    // Share the egui context so LlmClient can trigger repaints during streaming
+    raw_llm_client.set_egui_ctx(gui_ctx.clone());
+    
+    // Cancel flag for stopping in-flight requests
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    raw_llm_client.set_cancel_flag(cancel_flag.clone());
     
     let llm_client = Arc::new(raw_llm_client);
     
-    // Bridge Streaming Events to UI
-    let bridge_tx = ui_tx.clone();
     // UI event sender for non-streaming UI commands (e.g., show Memory Graph)
     let ui_tx_for_events = ui_tx.clone();
-    
-    // Clone memory_store for the eframe closure (before it moves into tokio loop)
-    let memory_store_for_ui = memory_store.clone();
-    
-    // Health check must be spawned inside a runtime, so we defer it to the runtime block below
 
     let action_handler = Arc::new(ActionHandler::new(
         clipboard.clone(),
@@ -207,83 +233,29 @@ fn main() -> anyhow::Result<()> {
     clipboard_listener::start_listener(cb_tx);
 
     let last_copy_time = Arc::new(Mutex::new(std::time::Instant::now()));
-    let last_copy_time_input = last_copy_time.clone();
 
     // Diagnostics (used to correlate rare/IME-related issues)
     let diag_start = Instant::now();
     let diag_seq = Arc::new(AtomicU64::new(0));
 
-    // Key Input Listener
-    let tx_input = tx.clone();
-    let diag_seq_input = diag_seq.clone();
-    let diag_start_input = diag_start;
-    std::thread::spawn(move || {
-        let mut ctrl_pressed = false;
-        
-        let _ = rdev::listen(move |event| {
-            let diag_enabled = std::env::var_os("CONTROLLER_DIAG_KEYS").is_some();
-            let now_ms = diag_start_input.elapsed().as_millis();
-            let seq = diag_seq_input.fetch_add(1, Ordering::Relaxed) + 1;
-
-            if diag_enabled {
-                debug!(
-                    "[diag #{seq} @ {now_ms}ms] rdev event: type={:?} name={:?} time={:?}",
-                    event.event_type,
-                    event.name,
-                    event.time
-                );
-            }
-
-            match event.event_type {
-                EventType::KeyPress(Key::ControlLeft) | EventType::KeyPress(Key::ControlRight) => ctrl_pressed = true,
-                EventType::KeyRelease(Key::ControlLeft) | EventType::KeyRelease(Key::ControlRight) => ctrl_pressed = false,
-                EventType::KeyPress(key) if ctrl_pressed => {
-                    // Heuristic: on Windows, IME composition may surface as an unknown key.
-                    // If this matches VK_PROCESSKEY (0xE5/229), avoid triggering hotkeys during composition.
-                    #[cfg(target_os = "windows")]
-                    if let Key::Unknown(raw) = key {
-                        const VK_PROCESSKEY: u32 = 0xE5;
-                        if raw == VK_PROCESSKEY {
-                            if diag_enabled {
-                                debug!("[diag #{seq} @ {now_ms}ms] IME composition suspected (Key::Unknown(VK_PROCESSKEY)); skipping hotkeys");
-                            }
-                            return;
-                        }
-                    }
-
-                    // Check if copy happened recently (e.g. < 2s)
-                    let check_elapsed = {
-                        let lock_start = Instant::now();
-                        match last_copy_time_input.lock() {
-                            Ok(guard) => {
-                                let lock_dur = lock_start.elapsed();
-                                if diag_enabled && lock_dur > Duration::from_millis(1) {
-                                    warn!("[diag #{seq} @ {now_ms}ms] last_copy_time lock took {:?}", lock_dur);
-                                }
-                                guard.elapsed() < Duration::from_millis(2000)
-                            }
-                            Err(_) => false,
-                        }
-                    };
-
-                    if diag_enabled {
-                        debug!("[diag #{seq} @ {now_ms}ms] ctrl+{:?} check_elapsed={}", key, check_elapsed);
-                    }
-
-                    if check_elapsed {
-                        match key {
-                            Key::KeyR => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::Format)); },
-                            Key::KeyT => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::TranslateE2C)); },
-                            Key::KeyY => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::TranslateC2E)); },
-                            Key::KeyE => { let _ = tx_input.try_send(AppEvent::TriggerAction(Action::Explain)); },
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-        });
-    });
+    // Initialize platform-specific hotkey system
+    let hotkey_system = match IntelliBoard::startup::init_hotkey_system(
+        tx.clone(),
+        shared_hotkeys.clone(),
+        last_copy_time.clone(),
+    ) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::error!("Failed to initialize hotkey system: {}", e);
+            None
+        }
+    };
+    
+    // Clone shared configs for async block
+    let shared_actions_inner = shared_actions.clone();
+    let shared_hotkeys_inner = shared_hotkeys.clone();
+    let hotkey_system_inner = hotkey_system.clone();
+    let cancel_flag_inner = cancel_flag.clone();
 
     // Main Tokio Loop
     std::thread::spawn(move || {
@@ -292,31 +264,60 @@ fn main() -> anyhow::Result<()> {
             info!("Event loop started");
             llm_client.spawn_health_check();
 
-            // Graph server task (receives MemoryEvent messages and updates MemoryStore)
-            tokio::spawn(graph_server::run(memory_store.clone(), graph_rx));
+            // IPC Server for Graph UI (create first to get notifier)
+            let ipc_server = GraphIpcServer::new(memory_store.clone(), 12345);
+            let graph_notifier = ipc_server.get_notifier();
             
-            // Bridge task for streaming
+            // Graph server task (receives MemoryEvent messages and updates MemoryStore)
+            // Pass the notifier so it can push updates to connected graph UIs
+            tokio::spawn(graph_server::run(memory_store.clone(), graph_rx, graph_notifier));
+
+            // Start IPC Server
             tokio::spawn(async move {
-                while let Some(event) = stream_rx.recv().await {
-                   let _ = bridge_tx.send(event);
-                }
+                ipc_server.run().await;
             });
 
             loop {
                 tokio::select! {
                     _ = cb_rx.recv() => {
+                        // Update timestamp IMMEDIATELY for hotkey gating
+                        // This must happen for ALL clipboard changes (text or image)
+                        // before any other processing or filtering
+                        if let Ok(mut guard) = last_copy_time.lock() {
+                            *guard = std::time::Instant::now();
+                        }
+                        
                         // Store clipboard content to memory (skip programmatic writes)
+                        // with IME-aware debouncing to handle Pinyin/other IME composition
                         if let Ok(text) = clipboard.get_text() {
                             if clipboard.should_ignore_clipboard_text(&text) {
-                                if std::env::var_os("CONTROLLER_DIAG_CLIPBOARD").is_some() {
+                                if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
                                     log::debug!("[diag] ignored programmatic clipboard write");
                                 }
                             } else {
-                                // Update timestamp (used for hotkey gating)
-                                if let Ok(mut guard) = last_copy_time.lock() {
-                                    *guard = std::time::Instant::now();
+                                // Check IME composition state (Windows-specific)
+                                #[cfg(windows)]
+                                let ime_composing = IntelliBoard::platform::is_ime_composing();
+                                #[cfg(not(windows))]
+                                let ime_composing = false;
+                                
+                                // Apply time+content debouncing for IME compatibility
+                                if let Some(wait_ms) = clipboard.should_debounce(&text, ime_composing) {
+                                    if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
+                                        log::debug!("[diag] debouncing clipboard for {}ms (ime={})", wait_ms, ime_composing);
+                                    }
+                                    // Schedule a delayed re-check by sleeping briefly and continuing
+                                    // The next clipboard event or timeout will re-trigger processing
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms.min(50))).await;
+                                    continue;
                                 }
-                                let _ = graph_tx.try_send(MemoryEvent::AddClipboard(text));
+                                
+                                // Content is stable - process it
+                                clipboard.mark_processed(&text);
+                                
+                                if let Err(e) = graph_tx.send(MemoryEvent::AddClipboard(text)).await {
+                                    error!("Failed to enqueue clipboard memory event: {}", e);
+                                }
                             }
                         }
                         let now_ms = diag_start.elapsed().as_millis();
@@ -327,25 +328,42 @@ fn main() -> anyhow::Result<()> {
                         debug!("Processing event: {:?}", event);
                         match event {
                             AppEvent::TriggerAction(action) => {
+                                // Cancel any in-flight request before starting new one
+                                cancel_flag_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                cancel_flag_inner.store(false, std::sync::atomic::Ordering::SeqCst);
+                                
+                                // Copy-gating is handled in the keyboard hook callback
+                                // If we receive this event, the hook already verified a recent copy
                                 let handler = action_handler.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = handler.handle(action).await {
-                                        error!("Action failed: {}", e);
+                                        // Don't log "Cancelled" as an error - it's intentional
+                                        if !e.to_string().contains("Cancelled") {
+                                            error!("Action failed: {}", e);
+                                        }
                                     }
                                 });
                             },
                             AppEvent::UserQuery(query) => {
+                                // Cancel any in-flight request before starting new one
+                                cancel_flag_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                cancel_flag_inner.store(false, std::sync::atomic::Ordering::SeqCst);
+                                
                                 info!("Processing user query: {}", query);
                                 let handler = action_handler.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = handler.handle(Action::UserQuery(query)).await {
-                                        error!("User query failed: {}", e);
+                                        if !e.to_string().contains("Cancelled") {
+                                            error!("User query failed: {}", e);
+                                        }
                                     }
                                 });
                             },
                              AppEvent::Cancel => {
-                                // Simple cancel logic would need task tracking, omitting for simplicity or implementing basic cancellation
-                                info!("Cancel requested");
+                                info!("Cancel requested - stopping in-flight request");
+                                cancel_flag_inner.store(true, std::sync::atomic::Ordering::SeqCst);
                             },
                             AppEvent::ToggleProcessing(enabled) => {
                                 // processor.set_enabled(enabled); // We removed processor
@@ -354,7 +372,45 @@ fn main() -> anyhow::Result<()> {
                             AppEvent::ShowMemoryGraph => {
                                 let _ = ui_tx_for_events.send(UiEvent::ShowMemoryGraph);
                             }
-                            _ => {}
+                            AppEvent::ShowHotkeyConfig => {
+                                let _ = ui_tx_for_events.send(UiEvent::ShowHotkeyConfig);
+                            }
+                            AppEvent::ConfigChanged(change) => {
+                                info!("Config file changed: {:?}", change);
+                                match change {
+                                    ConfigChange::ActionsConfig => {
+                                        match IntelliBoard::core::config::load_actions_config() {
+                                            Ok(cfg) => {
+                                                if let Ok(mut guard) = shared_actions_inner.write() {
+                                                    *guard = cfg;
+                                                    info!("Actions config reloaded");
+                                                }
+                                            }
+                                            Err(e) => error!("Failed to reload actions config: {}", e),
+                                        }
+                                    }
+                                    ConfigChange::HotkeysConfig => {
+                                        match IntelliBoard::core::config::load_hotkeys_config() {
+                                            Ok(cfg) => {
+                                                if let Ok(mut guard) = shared_hotkeys_inner.write() {
+                                                    *guard = cfg;
+                                                    info!("Hotkeys config reloaded");
+                                                }
+                                                // Reinstall hotkey system with new config
+                                                if let Some(ref hs) = hotkey_system_inner {
+                                                    if let Err(e) = hs.reinstall() {
+                                                        error!("Failed to reinstall hotkey system: {}", e);
+                                                    } else {
+                                                        info!("Hotkey system reinstalled with updated config");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => error!("Failed to reload hotkeys config: {}", e),
+                                        }
+                                    }
+                                    _ => debug!("Ignoring config change: {:?}", change),
+                                }
+                            }
                         }
                     }
                 }
@@ -370,7 +426,7 @@ fn main() -> anyhow::Result<()> {
             .with_decorations(false)
             .with_transparent(true);
 
-        if std::env::var_os("CONTROLLER_NO_TOPMOST").is_some() {
+        if std::env::var_os("IntelliBoard_NO_TOPMOST").is_some() {
             builder
         } else {
             builder.with_always_on_top()
@@ -382,12 +438,19 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
-        "Controller",
+    let pm_for_cleanup = process_manager.clone();
+    let result = eframe::run_native(
+        "IntelliBoard",
         options,
         Box::new(move |cc| {
-            let app = MyApp::new(cc, ui_rx, tx.clone(), gui_ctx, tray_handler, memory_store_for_ui);
+            let app = MyApp::new(cc, ui_rx, tx.clone(), gui_ctx, tray_handler, process_manager);
             Box::new(app)
         }),
-    ).map_err(|e| anyhow::anyhow!("Eframe error: {}", e))
+    );
+    
+    // Clean up child processes on exit
+    info!("Main app exiting, killing child processes...");
+    pm_for_cleanup.kill_all();
+    
+    result.map_err(|e| anyhow::anyhow!("Eframe error: {}", e))
 }

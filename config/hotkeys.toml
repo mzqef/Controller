@@ -1,0 +1,58 @@
+# ============================================================================
+# IntelliBoard Hotkey Configuration
+# ============================================================================
+#
+# Each [[bindings]] entry maps a key combination to an AI action.
+# Hotkeys ONLY trigger if you copied text within the last 2 seconds.
+# Otherwise, the key passes through to other applications normally.
+#
+# FIELDS:
+#   key       (required) - Key identifier: KeyA-KeyZ, Digit0-Digit9, F1-F12
+#   action    (required) - Action ID from actions.toml (e.g., "format", "translate_e2c")
+#   modifiers (optional) - Modifier keys, default: "Ctrl"
+#                          Supported: "Ctrl", "Ctrl+Shift", "Ctrl+Alt", "Alt"
+#
+# EXAMPLES:
+#   [[bindings]]
+#   key = "KeyS"
+#   action = "summarize"
+#   modifiers = "Ctrl+Shift"   # Ctrl+Shift+S to summarize
+#
+# HOT-RELOAD: Changes are applied automatically without restarting.
+# CONFIG UI: Open from tray menu → "Function Configuration" → Hotkeys tab
+# USER OVERRIDES: ~/.config/IntelliBoard/hotkeys.toml (Linux/macOS)
+#                 %APPDATA%\IntelliBoard\hotkeys.toml (Windows)
+# ============================================================================
+
+[[bindings]]
+key = "KeyR"
+action = "format"
+
+[[bindings]]
+key = "KeyT"
+action = "translate_e2c"
+
+[[bindings]]
+key = "KeyY"
+action = "translate_c2e"
+
+[[bindings]]
+key = "KeyE"
+action = "explain"
+
+[[bindings]]
+key = "KeyO"
+action = "vl_ocr"
+
+# ============================================================================
+# Add your own hotkeys below
+# ============================================================================
+# [[bindings]]
+# key = "KeyS"
+# action = "summarize"
+# modifiers = "Ctrl"
+#
+# [[bindings]]
+# key = "KeyC"
+# action = "code_review"
+# modifiers = "Ctrl+Shift"

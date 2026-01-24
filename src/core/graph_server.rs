@@ -1,10 +1,15 @@
 use crate::core::memory::MemoryEvent;
 use crate::core::memory_store::MemoryStore;
-use log::error;
+use crate::core::ipc_server::GraphNotification;
+use log::{error, debug};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, broadcast};
 
-pub async fn run(store: Arc<MemoryStore>, mut rx: mpsc::Receiver<MemoryEvent>) {
+pub async fn run(
+    store: Arc<MemoryStore>,
+    mut rx: mpsc::Receiver<MemoryEvent>,
+    notify_tx: broadcast::Sender<GraphNotification>,
+) {
     while let Some(event) = rx.recv().await {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match event {
@@ -36,6 +41,12 @@ pub async fn run(store: Arc<MemoryStore>, mut rx: mpsc::Receiver<MemoryEvent>) {
 
         if result.is_err() {
             error!("GraphServer panicked while handling MemoryEvent; continuing");
+        } else {
+            // Notify connected graph UIs that data has changed
+            if notify_tx.receiver_count() > 0 {
+                debug!("Notifying {} graph UI client(s) of data change", notify_tx.receiver_count());
+                let _ = notify_tx.send(GraphNotification);
+            }
         }
     }
 }

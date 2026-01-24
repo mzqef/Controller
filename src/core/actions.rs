@@ -1,27 +1,63 @@
 use std::sync::Arc;
-use std::sync::mpsc;
 use anyhow::{Result, anyhow};
 use log::{info, error};
-use crate::core::clipboard::ClipboardManager;
+use crate::core::clipboard::{ClipboardManager, ClipboardContentType};
 use crate::core::memory::MemoryEvent;
 use crate::core::memory_store::MemoryStore;
 use crate::core::memory::ActionType as MemActionType;
 use crate::api::client::LlmClient;
 use crate::ui::UiEvent;
 
+/// Action now carries the action ID from config, or UserQuery with text
 #[derive(Debug, Clone)]
 pub enum Action {
-    Format,
-    TranslateE2C,
-    TranslateC2E,
-    Explain,
-    UserQuery(String), // User-provided query text
+    /// Execute a configured action by its ID
+    Execute(String),
+    /// User-provided query text (special case)
+    UserQuery(String),
+    /// Vision action with base64-encoded image data
+    Vision { action_id: String, image_base64: String },
+}
+
+impl Action {
+    /// Convert action name to Action enum (normalizes to lowercase)
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.is_empty() {
+            None
+        } else {
+            // Normalize to lowercase for consistent matching with action IDs
+            Some(Action::Execute(name.to_lowercase()))
+        }
+    }
+    
+    /// Get the action ID for memory storage
+    pub fn to_mem_action_type(&self) -> MemActionType {
+        match self {
+            Action::Execute(id) | Action::Vision { action_id: id, .. } => match id.as_str() {
+                "format" => MemActionType::Format,
+                "translate_e2c" => MemActionType::TranslateE2C,
+                "translate_c2e" => MemActionType::TranslateC2E,
+                "explain" => MemActionType::Explain,
+                _ => MemActionType::UserQuery, // Fallback for custom actions
+            },
+            Action::UserQuery(_) => MemActionType::UserQuery,
+        }
+    }
+    
+    /// Get the action ID string
+    pub fn action_id(&self) -> &str {
+        match self {
+            Action::Execute(id) => id,
+            Action::Vision { action_id, .. } => action_id,
+            Action::UserQuery(_) => "user_query",
+        }
+    }
 }
 
 pub struct ActionHandler {
     clipboard: Arc<ClipboardManager>,
     llm_client: Arc<LlmClient>,
-    ui_tx: Option<mpsc::Sender<UiEvent>>,
+    ui_tx: Option<flume::Sender<UiEvent>>,
     graph_tx: Option<tokio::sync::mpsc::Sender<MemoryEvent>>,
     memory_store: Option<Arc<MemoryStore>>,
 }
@@ -30,7 +66,7 @@ impl ActionHandler {
     pub fn new(
         clipboard: Arc<ClipboardManager>,
         llm_client: Arc<LlmClient>,
-        ui_tx: Option<mpsc::Sender<UiEvent>>,
+        ui_tx: Option<flume::Sender<UiEvent>>,
         graph_tx: Option<tokio::sync::mpsc::Sender<MemoryEvent>>,
         memory_store: Option<Arc<MemoryStore>>,
     ) -> Self {
@@ -42,52 +78,106 @@ impl ActionHandler {
             memory_store,
         }
     }
+    
+    /// Get the display label for an action
+    fn get_action_label(&self, action_id: &str) -> String {
+        self.llm_client.get_action_label(action_id)
+            .unwrap_or_else(|| action_id.to_string())
+    }
 
     pub async fn handle(&self, action: Action) -> Result<()> {
         info!("Handling action: {:?}", action);
 
-        // Check for Image first (VLM/OCR path)
-        // Note: arboard image handling might be tricky. 
-        // For this refactor we prioritize Text, but structure is here for Image.
-        /* 
-        if let Ok(_img) = self.clipboard.get_image() {
-             info!("Image detected in clipboard. VLM/OCR not fully implemented yet.");
-             // TODO: specific VLM logic
-             // return Ok(());
+        // Handle vision action directly
+        if let Action::Vision { action_id, image_base64 } = &action {
+            let label = self.get_action_label(action_id);
+            
+            // Send UI update with action label
+            if let Some(tx) = &self.ui_tx {
+                let _ = tx.send(UiEvent::ProcessingStarted(label));
+            }
+            
+            // Execute vision action
+            let result = self.llm_client.execute_vision_action(action_id, image_base64).await;
+            
+            if let Some(tx) = &self.ui_tx {
+                match &result {
+                    Ok(extracted_text) => {
+                        // Write extracted text to clipboard
+                        if let Err(e) = self.clipboard.set_text_programmatic(extracted_text) {
+                            error!("Failed to write OCR result to clipboard: {}", e);
+                        }
+                        let _ = tx.send(UiEvent::ShowResult("[Image]".to_string(), extracted_text.clone()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(UiEvent::StreamError(e.to_string()));
+                    }
+                }
+            }
+            
+            return result.map(|_| ());
         }
-        */
 
         // For UserQuery, use the query text directly instead of clipboard
-        let (text, is_user_query) = match &action {
-            Action::UserQuery(query) => (query.clone(), true),
-            _ => {
+        let (text, is_user_query, action_id) = match &action {
+            Action::UserQuery(query) => (query.clone(), true, "user_query".to_string()),
+            Action::Execute(id) => {
+                // Check if this is a vision action and clipboard has image
+                if self.llm_client.is_vision_action(id) {
+                    match self.clipboard.content_type() {
+                        ClipboardContentType::Image => {
+                            // Convert to vision action
+                            match self.clipboard.get_image_as_base64_png() {
+                                Ok(base64) => {
+                                    let vision_action = Action::Vision {
+                                        action_id: id.clone(),
+                                        image_base64: base64,
+                                    };
+                                    // Recursively handle as vision action
+                                    return Box::pin(self.handle(vision_action)).await;
+                                }
+                                Err(e) => {
+                                    error!("Failed to encode image: {}", e);
+                                    return Err(anyhow!("Failed to encode clipboard image: {}", e));
+                                }
+                            }
+                        }
+                        ClipboardContentType::Text => {
+                            // Vision action but text in clipboard - fall through to text handling
+                            info!("Vision action {} but clipboard has text, processing as text", id);
+                        }
+                        ClipboardContentType::Empty => {
+                            return Err(anyhow!("Clipboard is empty"));
+                        }
+                    }
+                }
+                
                 // Text path from clipboard
                 match self.clipboard.get_text() {
-                    Ok(t) => (t, false),
+                    Ok(t) => (t, false, id.clone()),
                     Err(e) => {
                         error!("Failed to get text from clipboard: {}", e);
                         return Err(anyhow!("Clipboard empty or invalid"));
                     }
                 }
             }
+            Action::Vision { .. } => unreachable!(), // Handled above
         };
 
         if text.trim().is_empty() {
              return Ok(());
         }
 
-        // Send UI update "Processing..."
+        // Get action label for UI
+        let label = self.get_action_label(&action_id);
+
+        // Send UI update "Processing..." with action label
         if let Some(tx) = &self.ui_tx {
-            let _ = tx.send(UiEvent::ProcessingStarted);
+            let _ = tx.send(UiEvent::ProcessingStarted(label));
         }
 
-        let result = match &action {
-            Action::Format => self.process_format(&text).await,
-            Action::TranslateE2C => self.process_translate(&text, "English", "Chinese").await,
-            Action::TranslateC2E => self.process_translate(&text, "Chinese", "English").await,
-            Action::Explain => self.process_explain(&text).await,
-            Action::UserQuery(_) => self.process_user_query(&text).await,
-        };
+        // Execute the action via LLM client
+        let result = self.llm_client.execute_action(&action_id, &text).await;
 
         // Send UI update "Finished" or "Error"
         if let Some(tx) = &self.ui_tx {
@@ -96,13 +186,7 @@ impl ActionHandler {
                     // Store to mid-term memory
                     if let Some(store) = &self.memory_store {
                         let input_id = store.find_input_for_clipboard(&text);
-                        let action_type = match &action {
-                            Action::Format => MemActionType::Format,
-                            Action::TranslateE2C => MemActionType::TranslateE2C,
-                            Action::TranslateC2E => MemActionType::TranslateC2E,
-                            Action::Explain => MemActionType::Explain,
-                            Action::UserQuery(_) => MemActionType::UserQuery,
-                        };
+                        let action_type = action.to_mem_action_type();
 
                         if let Some(graph_tx) = &self.graph_tx {
                             let _ = graph_tx
@@ -121,11 +205,12 @@ impl ActionHandler {
                     // For user queries, don't modify clipboard - just show result
                     if !is_user_query {
                         // Update clipboard with result
-                        // Replace clipboard with processed output only
                         if let Err(e) = self.clipboard.set_text_programmatic(processed) {
                             error!("Failed to write to clipboard: {}", e);
                         }
                     }
+                    
+                    // Send ShowResult to finalize the UI
                     let _ = tx.send(UiEvent::ShowResult(text.clone(), processed.clone()));
                 },
                 Err(e) => {
@@ -135,23 +220,5 @@ impl ActionHandler {
         }
 
         result.map(|_| ())
-    }
-
-    async fn process_format(&self, text: &str) -> Result<String> {
-        self.llm_client.chat_completion( "copy_check", text).await
-    }
-
-    async fn process_translate(&self, text: &str, source: &str, target: &str) -> Result<String> {
-        // We use a specialized method for translation if needed, or chat_completion with specific prompt
-        self.llm_client.translate(text, source, target).await
-    }
-
-    async fn process_explain(&self, text: &str) -> Result<String> {
-        self.llm_client.chat_completion("explain", text).await
-    }
-
-    async fn process_user_query(&self, text: &str) -> Result<String> {
-        // Use the streaming-enabled user query method with remote/local fallback
-        self.llm_client.user_query_streaming(text).await
     }
 }

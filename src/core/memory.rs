@@ -5,7 +5,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryType {
     ShortTerm, // Raw clipboard captures
-    MidTerm,   // Action results (translations, explanations, copy checks)
+    MidTerm,   // Action results (translations, explanations, formats)
     LongTerm,  // User-promoted items with persistence
 }
 

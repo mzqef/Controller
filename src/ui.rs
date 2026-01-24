@@ -1,16 +1,15 @@
 pub mod memory_graph;
+pub mod hotkey_config;
+pub mod theme;
 
 use eframe::egui;
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use log::info;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use crate::core::events::AppEvent;
-use crate::core::memory_store::MemoryStore;
 use tokio::sync::mpsc::Sender;
 use tray_icon::menu::{MenuEvent, CheckMenuItem};
 use tray_icon::TrayIconEvent;
-use memory_graph::MemoryGraphView;
 
 pub struct TrayHandler {
     pub icon: tray_icon::TrayIcon,
@@ -18,20 +17,20 @@ pub struct TrayHandler {
     pub enable_id: tray_icon::menu::MenuId,
     pub exit_id: tray_icon::menu::MenuId,
     pub show_log_id: tray_icon::menu::MenuId,
+    pub hotkey_config_id: tray_icon::menu::MenuId,
     pub tx: Sender<AppEvent>,
     pub custom_commands: std::collections::HashMap<tray_icon::menu::MenuId, String>,
 }
 
-#[allow(dead_code)]
 pub enum UiEvent {
-    ProcessingStarted,
-    CopyPressed,
-    SetProcessingEnabled(bool),
+    /// Processing started with action label for display (e.g., "Translation", "Image OCR")
+    ProcessingStarted(String),
     ShowResult(String, String), // original, result
     StreamUpdate(String), // chunk
     StreamEnd(bool), // true = success, false = incomplete
     StreamError(String), // error message
     ShowMemoryGraph,
+    ShowHotkeyConfig,
     Quit,
 }
 
@@ -46,43 +45,35 @@ enum AppState {
 }
 
 pub struct MyApp {
-    rx: Receiver<UiEvent>,
+    rx: flume::Receiver<UiEvent>,
     app_tx: Sender<AppEvent>,
-    text: String, // The full text received so far
-    displayed_text: String, // The text currently shown (for typewriter effect)
-    original_text: String, // This will be the content of the input box
+    text: String,
+    displayed_text: String,
+    original_text: String,
     visible: bool,
-    focus_grace_period: Option<Instant>,
     needs_resize: bool,
     state: AppState,
     tray_handler: Arc<Mutex<TrayHandler>>,
     last_type_time: Instant,
-    // Memory Graph
-    memory_store: Arc<MemoryStore>,
-    memory_graph_view: MemoryGraphView,
-    show_memory_graph: bool,
+    process_manager: Arc<crate::core::process_manager::ProcessManager>,
+    /// Current action label for processing indicator
+    current_action_label: String,
 }
 
 impl MyApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        rx: Receiver<UiEvent>,
+        rx: flume::Receiver<UiEvent>,
         app_tx: Sender<AppEvent>,
         ctx_holder: Arc<Mutex<Option<egui::Context>>>,
         tray_handler: Arc<Mutex<TrayHandler>>,
-        memory_store: Arc<MemoryStore>,
+        process_manager: Arc<crate::core::process_manager::ProcessManager>,
     ) -> Self {
         info!("MyApp initialized");
-        // Share the context
         *ctx_holder.lock().unwrap() = Some(cc.egui_ctx.clone());
         
-        // Load fonts
-        Self::configure_fonts(&cc.egui_ctx);
-        
-        // Apply Theme
-        Self::apply_japanese_theme(&cc.egui_ctx);
-
-        let memory_graph_view = MemoryGraphView::new(memory_store.clone());
+        theme::configure_fonts(&cc.egui_ctx);
+        theme::apply_theme(&cc.egui_ctx);
 
         Self {
             rx,
@@ -91,84 +82,13 @@ impl MyApp {
             displayed_text: String::new(),
             original_text: String::new(),
             visible: false,
-            focus_grace_period: None,
             needs_resize: false,
             state: AppState::Idle,
             tray_handler,
             last_type_time: Instant::now(),
-            memory_store,
-            memory_graph_view,
-            show_memory_graph: false,
+            process_manager,
+            current_action_label: String::new(),
         }
-    }
-
-    fn apply_japanese_theme(ctx: &egui::Context) {
-        let mut visuals = egui::Visuals::dark();
-        
-        // Japan 2046 Palette (Cyber-Japonism)
-        let bg_color = egui::Color32::from_rgb(10, 10, 16); // Deep Cyber Night
-        let panel_color = egui::Color32::from_rgb(15, 15, 20); // Slightly lighter
-        let neon_cyan = egui::Color32::from_rgb(0, 243, 255); // Cyber Cyan
-        let neon_pink = egui::Color32::from_rgb(255, 0, 60); // Cyber Pink
-        let text_color = egui::Color32::from_rgb(220, 230, 255); // Cool White
-
-        visuals.panel_fill = panel_color;
-        visuals.window_fill = bg_color;
-        visuals.override_text_color = Some(text_color);
-        
-        // Selection
-        visuals.selection.bg_fill = neon_pink;
-        visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        
-        // Widgets
-        visuals.widgets.noninteractive.bg_fill = panel_color;
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, neon_cyan); // Neon borders
-        
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(25, 25, 35);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(35, 35, 50);
-        visuals.widgets.active.bg_fill = neon_cyan;
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
-        
-        ctx.set_visuals(visuals);
-    }
-
-    fn configure_fonts(ctx: &egui::Context) {
-        let mut fonts = egui::FontDefinitions::default();
-        
-        // Cross-platform font search list
-        let font_candidates = [
-            // Windows
-            "c:\\Windows\\Fonts\\msyh.ttc", // Microsoft YaHei
-            "c:\\Windows\\Fonts\\simhei.ttf", // SimHei
-            "c:\\Windows\\Fonts\\msgothic.ttc", // MS Gothic
-            // macOS
-            "/System/Library/Fonts/PingFang.ttc",
-            "/Library/Fonts/Arial Unicode.ttf",
-            // Linux
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        ];
-        
-        for path in font_candidates {
-            if let Ok(font_data) = std::fs::read(path) {
-                fonts.font_data.insert(
-                    "cjk_font".to_owned(),
-                    egui::FontData::from_owned(font_data),
-                );
-
-                // Put CJK font first (highest priority) for proportional text:
-                fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "cjk_font".to_owned());
-
-                // Put CJK font as last fallback for monospace:
-                fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk_font".to_owned());
-
-                ctx.set_fonts(fonts);
-                info!("Loaded CJK font from {}", path);
-                return;
-            }
-        }
-        log::warn!("Failed to load any CJK fonts. Characters may not display correctly.");
     }
 }
 
@@ -179,6 +99,8 @@ impl eframe::App for MyApp {
             let handler = self.tray_handler.lock().unwrap();
             if event.id == handler.exit_id {
                 info!("Tray Exit clicked");
+                // Kill all child processes before exiting
+                self.process_manager.kill_all();
                 std::process::exit(0);
             } else if event.id == handler.enable_id {
                 let enabled = handler.enable_item.is_checked();
@@ -186,9 +108,9 @@ impl eframe::App for MyApp {
                 
                 // Update Icon
                 let new_icon = if enabled {
-                    crate::load_icon(60, 24, 22) // Dark Red (Active)
+                    crate::load_tray_icon_active()
                 } else {
-                    crate::load_icon(128, 128, 128) // Grey (Inactive)
+                    crate::load_tray_icon_inactive()
                 };
                 let _ = handler.icon.set_icon(Some(new_icon));
 
@@ -201,7 +123,7 @@ impl eframe::App for MyApp {
                         .filter_map(|e| e.ok())
                         .filter(|e| {
                             let name = e.file_name().to_string_lossy().to_string();
-                            name.starts_with("controller") && name.ends_with(".log")
+                            name.starts_with("IntelliBoard") && name.ends_with(".log")
                         })
                         .collect();
                     
@@ -213,6 +135,9 @@ impl eframe::App for MyApp {
                         let _ = std::process::Command::new("notepad").arg(path).spawn();
                     }
                 }
+            } else if event.id == handler.hotkey_config_id {
+                info!("Tray Configure Hotkeys clicked");
+                let _ = handler.tx.try_send(AppEvent::ShowHotkeyConfig);
             } else if let Some(cmd) = handler.custom_commands.get(&event.id) {
                 info!("Executing custom command: {}", cmd);
                 #[cfg(target_os = "windows")]
@@ -241,92 +166,74 @@ impl eframe::App for MyApp {
         // Check for new events
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                UiEvent::ProcessingStarted => {
-                    info!("UI received ProcessingStarted event.");
+                UiEvent::ProcessingStarted(action_label) => {
+                    info!("UI received ProcessingStarted event: {}", action_label);
                     self.text.clear();
                     self.displayed_text.clear();
+                    self.current_action_label = action_label;
                     self.visible = true;
-                    self.focus_grace_period = Some(Instant::now());
                     self.needs_resize = true;
                     self.state = AppState::Waiting;
 
-                    if std::env::var_os("CONTROLLER_DIAG_UI").is_some() {
+                    if std::env::var_os("IntelliBoard_DIAG_UI").is_some() {
                         info!("[diag] UI show: ProcessingStarted");
                     }
                     
-                    // Move window to a visible position and set fixed size
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([100.0, 100.0].into()));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([500.0, 700.0].into()));
-                    if std::env::var_os("CONTROLLER_NO_UI_FOCUS").is_none() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    } else if std::env::var_os("CONTROLLER_DIAG_UI").is_some() {
-                        info!("[diag] UI focus suppressed by CONTROLLER_NO_UI_FOCUS");
-                    }
-                    ctx.request_repaint();
-                }
-                UiEvent::CopyPressed => {
-                    info!("UI received CopyPressed event.");
-                    // Briefly show the UI to acknowledge the copy action when processing is disabled
-                    self.visible = true;
-                    self.focus_grace_period = Some(Instant::now());
-                    self.needs_resize = true;
-
-                    if std::env::var_os("CONTROLLER_DIAG_UI").is_some() {
-                        info!("[diag] UI show: CopyPressed");
-                    }
-                    ctx.request_repaint();
-                }
-                UiEvent::SetProcessingEnabled(enabled) => {
-                    info!("UI received SetProcessingEnabled: {}", enabled);
-                    // Update tray menu check and icon
-                    let handler = self.tray_handler.lock().unwrap();
-                    // Update check menu item
-                    let _ = handler.enable_item.set_checked(enabled);
-                    // Update icon
-                    let new_icon = if enabled {
-                        crate::load_icon(60, 24, 22) // Dark Red (Active)
-                    } else {
-                        crate::load_icon(128, 128, 128) // Grey (Inactive)
-                    };
-                    let _ = handler.icon.set_icon(Some(new_icon));
+                    // Don't position/focus here - handled in processing bar section
                     ctx.request_repaint();
                 }
                 UiEvent::ShowResult(original, content) => {
-                    info!("UI received content to show. Length: {}", content.len());
-                    self.text = content.clone();
-                    self.displayed_text = content; // Show immediately for non-streaming
+                    info!("UI received ShowResult. Length: {}", content.len());
                     self.original_text = original;
+                    
+                    // If we were streaming, text is already populated via StreamUpdate
+                    // Just let the typewriter continue - don't change state or text
+                    if self.state != AppState::Streaming {
+                        // No streaming happened (very fast or non-streaming response)
+                        self.text = content.clone();
+                        self.displayed_text = content;
+                        self.state = AppState::Finished;
+                    }
+                    // If streaming, stay in Streaming state - typewriter will transition to Finished
+                    
                     self.visible = true;
-                    self.focus_grace_period = Some(Instant::now());
                     self.needs_resize = true;
-                    self.state = AppState::Finished;
 
-                    if std::env::var_os("CONTROLLER_DIAG_UI").is_some() {
+                    if std::env::var_os("IntelliBoard_DIAG_UI").is_some() {
                         info!("[diag] UI show: ShowResult");
                     }
                     
-                    // Move window to a visible position and set fixed size
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([100.0, 100.0].into()));
+                    // Move window to right side, lower position
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([1350.0, 250.0].into()));
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([500.0, 700.0].into()));
-                    if std::env::var_os("CONTROLLER_NO_UI_FOCUS").is_none() {
+                    if std::env::var_os("IntelliBoard_NO_UI_FOCUS").is_none() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    } else if std::env::var_os("CONTROLLER_DIAG_UI").is_some() {
-                        info!("[diag] UI focus suppressed by CONTROLLER_NO_UI_FOCUS");
+                    } else if std::env::var_os("IntelliBoard_DIAG_UI").is_some() {
+                        info!("[diag] UI focus suppressed by IntelliBoard_NO_UI_FOCUS");
                     }
                     ctx.request_repaint();
                 }
                 UiEvent::StreamUpdate(chunk) => {
+                    info!("UI StreamUpdate: +{} bytes, total text={}, displayed={}", 
+                          chunk.len(), self.text.len() + chunk.len(), self.displayed_text.len());
                     self.text.push_str(&chunk);
                     // Don't update displayed_text here, let the typewriter effect handle it
                     
-                    // If we were waiting, switch to streaming immediately to hide progress bar
+                    // If we were waiting, switch to streaming and show result window
                     if self.state == AppState::Waiting {
-                         self.state = AppState::Streaming;
-                         self.needs_resize = true; // Resize once when starting to stream
+                        info!("Transitioning Waiting -> Streaming");
+                        self.state = AppState::Streaming;
+                        self.needs_resize = true;
+                        
+                        // Move to result window position/size
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([1350.0, 250.0].into()));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([500.0, 700.0].into()));
                     }
                     ctx.request_repaint();
                 }
                 UiEvent::StreamEnd(success) => {
+                    info!("UI StreamEnd: success={}, text={}, displayed={}", 
+                          success, self.text.len(), self.displayed_text.len());
                     self.state = if success { AppState::Finished } else { AppState::Incomplete };
                     // Ensure all text is shown at the end
                     self.displayed_text = self.text.clone();
@@ -340,9 +247,49 @@ impl eframe::App for MyApp {
                     self.needs_resize = true;
                     ctx.request_repaint();
                 }
+// use crate::core::ipc_server; // Removed misplaced import
+
+// ...
+
                 UiEvent::ShowMemoryGraph => {
-                    self.show_memory_graph = true;
-                    ctx.request_repaint();
+                    info!("Launching Memory Graph UI process...");
+                    
+                    #[cfg(feature = "debug-mode")]
+                    let port = 12345;
+                    #[cfg(not(feature = "debug-mode"))]
+                    let port = 12345; // TODO: Configurable port?
+                    
+                    match crate::core::process_manager::build_memory_graph_command(port) {
+                        Ok(cmd) => {
+                            if let Err(e) = self.process_manager.spawn_or_focus(
+                                "memory_graph",
+                                "IntelliBoard Memory Graph",
+                                cmd
+                            ) {
+                                log::error!("Failed to spawn/focus Memory Graph: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to build Memory Graph command: {}", e);
+                        }
+                    }
+                }
+                UiEvent::ShowHotkeyConfig => {
+                    info!("Spawning Functions Configuration window...");
+                    match crate::core::process_manager::build_functions_config_command() {
+                        Ok(cmd) => {
+                            if let Err(e) = self.process_manager.spawn_or_focus(
+                                "functions_config",
+                                "IntelliBoard Functions",
+                                cmd
+                            ) {
+                                log::error!("Failed to spawn/focus Functions Config: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to build Functions Config command: {}", e);
+                        }
+                    }
                 }
                 UiEvent::Quit => {
                     info!("UI received Quit event. Exiting...");
@@ -351,24 +298,38 @@ impl eframe::App for MyApp {
             }
         }
 
-        // Typewriter Effect Logic
+        // Typewriter Effect Logic - fast streaming display
+        // Goal: Display new content quickly while maintaining smooth animation feel
         if self.state == AppState::Streaming && self.displayed_text.len() < self.text.len() {
-            let now = Instant::now();
-            // Adjust speed: faster if backlog is large
             let backlog = self.text.len() - self.displayed_text.len();
-            let speed_ms = if backlog > 50 { 5 } else if backlog > 20 { 10 } else { 20 };
             
-            if now.duration_since(self.last_type_time).as_millis() > speed_ms {
-                // Add next char(s)
-                // Be careful with UTF-8 boundaries
-                let remaining = &self.text[self.displayed_text.len()..];
-                if let Some(c) = remaining.chars().next() {
-                    self.displayed_text.push(c);
-                    self.last_type_time = now;
-                    self.needs_resize = true; // Resize as text grows
-                }
+            // Always make progress - show at least 1 char per frame
+            // Scale up when backlog is large to catch up quickly
+            let chars_to_add = if backlog > 100 {
+                backlog // Show everything immediately - way behind
+            } else if backlog > 20 {
+                10.max(backlog / 3) // Fast catch-up
+            } else {
+                3.max(backlog) // Always show at least the backlog or 3 chars
+            };
+            
+            // Add characters, respecting UTF-8 boundaries
+            let remaining = &self.text[self.displayed_text.len()..];
+            let mut added = 0;
+            for c in remaining.chars().take(chars_to_add) {
+                self.displayed_text.push(c);
+                added += 1;
             }
-            // Always request repaint if we assume typewriter is active, to keep the loop running
+            
+            if added > 0 {
+                self.needs_resize = true;
+            }
+            
+            // Request repaint immediately to keep animation smooth
+            ctx.request_repaint();
+        } else if self.state == AppState::Streaming && self.displayed_text.len() >= self.text.len() && !self.text.is_empty() {
+            // Typewriter caught up and we have content - stay in streaming until StreamEnd
+            // Just keep requesting repaints to be ready for more content
             ctx.request_repaint();
         }
 
@@ -377,61 +338,81 @@ impl eframe::App for MyApp {
              ctx.request_repaint();
         }
 
-        // Memory Graph as separate native viewport (not affected by main window position)
-        if self.show_memory_graph {
-            let graph_viewport_id = egui::ViewportId::from_hash_of("memory_graph_viewport");
-            let graph_store = self.memory_store.clone();
+        // During WAITING ONLY, show small indicator bar at bottom
+        // Once streaming starts, switch to the full result window
+        let is_waiting = self.state == AppState::Waiting;
+        
+        if is_waiting {
+            // Show small processing indicator bar at bottom-center of screen
+            // Size: ~280x50 pixels, always on top
+            // Use monitor info for positioning - assume 1920x1080 as fallback
+            let bar_width = 280.0;
+            let bar_height = 50.0;
             
-            // We need to pass a mutable reference to the graph view, but show_viewport_immediate
-            // takes an FnOnce. So we'll swap it out temporarily.
-            let mut graph_view = std::mem::replace(
-                &mut self.memory_graph_view,
-                MemoryGraphView::new(graph_store.clone())
-            );
+            // Get primary monitor size (fallback to common resolution)
+            let (screen_width, screen_height) = ctx.input(|i| {
+                i.viewport().monitor_size.map(|s| (s.x, s.y)).unwrap_or((1920.0, 1080.0))
+            });
             
-            let mut should_close = false;
-            let mut graph_panicked = false;
+            let x_pos = (screen_width - bar_width) / 2.0;
+            let y_pos = screen_height - bar_height - 60.0; // ~2cm (60px) from bottom
             
-            ctx.show_viewport_immediate(
-                graph_viewport_id,
-                egui::ViewportBuilder::default()
-                    .with_title("🧠 Memory Graph")
-                    .with_inner_size([900.0, 700.0])
-                    .with_min_inner_size([400.0, 300.0]),
-                |ctx, _class| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            graph_view.draw(ui, ctx);
-                        }));
-                        if result.is_err() {
-                            log::error!("Memory Graph panicked; resetting graph view");
-                            graph_panicked = true;
-                            ui.colored_label(egui::Color32::RED, "Memory Graph crashed and was reset.");
-                        }
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([x_pos, y_pos].into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([bar_width, bar_height].into()));
+            
+            // Processing bar frame
+            let frame = egui::Frame::default()
+                .fill(egui::Color32::from_rgb(10, 10, 16))
+                .rounding(4.0)
+                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 243, 255)))
+                .inner_margin(8.0);
+            
+            egui::CentralPanel::default()
+                .frame(frame)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        // Animated spinner/progress indicator
+                        let time = ctx.input(|i| i.time);
+                        let phase = (time * 2.0 % 1.0) as f32;
+                        let dots = match ((phase * 4.0) as usize) % 4 {
+                            0 => "   ",
+                            1 => ".  ",
+                            2 => ".. ",
+                            _ => "...",
+                        };
+                        
+                        // Action label
+                        let label_text = if self.current_action_label.is_empty() {
+                            "Processing".to_string()
+                        } else {
+                            self.current_action_label.clone()
+                        };
+                        
+                        ui.label(
+                            egui::RichText::new(format!("{}{}", label_text, dots))
+                                .color(egui::Color32::from_rgb(0, 243, 255))
+                                .size(14.0)
+                                .monospace()
+                        );
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Stop button
+                            if ui.button(
+                                egui::RichText::new("✕")
+                                    .color(egui::Color32::from_rgb(255, 100, 100))
+                                    .size(14.0)
+                            ).clicked() {
+                                info!("User clicked stop button");
+                                let _ = self.app_tx.try_send(AppEvent::Cancel);
+                                self.visible = false;
+                                self.state = AppState::Idle;
+                            }
+                        });
                     });
-                    
-                    // Handle Escape to close Memory Graph
-                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        should_close = true;
-                    }
-                    
-                    // Handle window close button
-                    if ctx.input(|i| i.viewport().close_requested()) {
-                        should_close = true;
-                    }
-                },
-            );
+                });
             
-            // Restore the graph view (reset after panic)
-            if graph_panicked {
-                self.memory_graph_view = MemoryGraphView::new(graph_store.clone());
-            } else {
-                self.memory_graph_view = graph_view;
-            }
-            
-            if should_close {
-                self.show_memory_graph = false;
-            }
+            ctx.request_repaint();
+            return;
         }
 
         if !self.visible {
@@ -442,30 +423,13 @@ impl eframe::App for MyApp {
             return;
         }
 
-        // Check focus status to auto-close the popup (AI result window).
-        // Memory Graph is a separate native viewport and should remain open.
-        if self.visible {
-            let should_close = if let Some(start) = self.focus_grace_period {
-                if start.elapsed() > Duration::from_millis(500) {
-                    // Grace period over, check focus
-                    !ctx.input(|i| i.focused)
-                } else {
-                    false // Still in grace period
-                }
-            } else {
-                !ctx.input(|i| i.focused)
-            };
-
-            if should_close {
-                 if std::env::var_os("CONTROLLER_DIAG_UI").is_some() {
-                     let focused = ctx.input(|i| i.focused);
-                     info!("[diag] UI auto-close (focused={})", focused);
-                 }
-                 self.visible = false;
-                 // Cancel processing if window closes/loses focus
-                 let _ = self.app_tx.try_send(AppEvent::Cancel);
-            }
-        }
+        // NOTE: Focus-based auto-close removed - window stays open until user explicitly closes it
+        // or a new action is triggered (which cancels the old one and shows new UI)
+        
+        // Result window - show full size popup for Finished/Error/Incomplete
+        // Move window to right side, proper size
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([1350.0, 250.0].into()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([500.0, 700.0].into()));
         
         // Custom Frame for Japan 2046 look
         let frame = egui::Frame::default()
@@ -530,7 +494,10 @@ impl eframe::App for MyApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                             if ui.button(egui::RichText::new("❌").color(egui::Color32::from_rgb(255, 0, 60))).clicked() {
+                                info!("User clicked close button");
+                                let _ = self.app_tx.try_send(AppEvent::Cancel);
                                 self.visible = false;
+                                self.state = AppState::Idle;
                             }
 
                             // Status Indicator
@@ -606,6 +573,8 @@ impl eframe::App for MyApp {
                             }
                         });
                 });
+        
+
             
                 // Footer (optional, maybe just space)
                 ui.add_space(5.0);
@@ -613,7 +582,10 @@ impl eframe::App for MyApp {
 
         // Close main UI on Escape (Memory Graph escape is handled earlier)
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            info!("User pressed Escape - closing window");
+            let _ = self.app_tx.try_send(AppEvent::Cancel);
             self.visible = false;
+            self.state = AppState::Idle;
         }
     }
 }

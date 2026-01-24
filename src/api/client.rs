@@ -1,13 +1,23 @@
+//! LLM API client with streaming and remote/local fallback.
+//!
+//! This module provides the [`LlmClient`] which handles:
+//! - Remote API calls with streaming responses
+//! - Automatic fallback to local LLM when remote is unavailable
+//! - Per-action configuration with extra parameters passthrough
+//! - Real-time UI updates during streaming
+
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use std::time::Duration;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use std::collections::HashMap;
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
 
-use crate::core::config::{LlmConfig, FunctionalityConfig};
+use crate::core::config::{ActionsConfig, ActionDefinition};
 
 // Helper to detect network errors (timeout, connection, DNS, etc)
 fn is_network_error(e: &anyhow::Error) -> bool {
@@ -15,16 +25,63 @@ fn is_network_error(e: &anyhow::Error) -> bool {
     s.contains("timed out") || s.contains("connection") || s.contains("dns") || s.contains("unreachable") || s.contains("network")
 }
 
+/// Content part for multimodal messages (text or image)
+#[derive(Serialize, Clone)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlData },
+}
+
+/// Image URL data with optional pixel constraints
+#[derive(Serialize, Clone)]
+pub struct ImageUrlData {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_pixels: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pixels: Option<u32>,
+}
+
+/// Message content: either simple text or multimodal array
+#[derive(Serialize, Clone)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Multimodal(Vec<ContentPart>),
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(skip_deserializing)]
+    pub content: MessageContent,
 }
 
-#[derive(Serialize)]
-struct TranslationOptions {
-    source_lang: String,
-    target_lang: String,
+// For deserialization (responses are always text)
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
+}
+
+// Helper to create text-only ChatMessage
+impl ChatMessage {
+    pub fn user_text(content: String) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: MessageContent::Text(content),
+        }
+    }
+    
+    pub fn user_multimodal(parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: MessageContent::Multimodal(parts),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -34,8 +91,23 @@ struct ChatRequest {
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     translation_options: Option<TranslationOptions>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Extra parameters passed through from config (flattened into the JSON)
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct TranslationOptions {
+    source_lang: String,
+    target_lang: String,
+}
+
+/// Response message (always text content)
+#[derive(Deserialize)]
+struct ChatResponseMessage {
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -45,7 +117,7 @@ struct ChatResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    message: ChatResponseMessage,
 }
 
 #[derive(Deserialize)]
@@ -66,30 +138,63 @@ struct ChatChunkDelta {
     content: Option<String>,
 }
 
+/// LLM client with remote/local fallback and streaming support.
+///
+/// # Features
+/// - Lazy HTTP client initialization
+/// - Automatic fallback to local LLM on network errors
+/// - Streaming responses with real-time UI updates
+/// - Per-action configuration with extra parameters
+///
+/// # Example
+/// ```ignore
+/// let client = LlmClient::new(config);
+/// client.set_ui_tx(ui_sender);
+/// let result = client.process_with_action("format", "text to process").await?;
+/// ```
 pub struct LlmClient {
     client: tokio::sync::OnceCell<Client>,
-    config: LlmConfig,
+    config: ActionsConfig,
     remote_available: Arc<AtomicBool>,
-    ui_tx: Option<tokio::sync::mpsc::Sender<crate::ui::UiEvent>>,
+    ui_tx: Option<flume::Sender<crate::ui::UiEvent>>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    /// egui context for triggering UI repaints when streaming
+    egui_ctx: Arc<std::sync::Mutex<Option<eframe::egui::Context>>>,
 }
 
 impl LlmClient {
-    pub fn new(config: LlmConfig) -> Self {
+    pub fn new(config: ActionsConfig) -> Self {
         Self { 
             client: tokio::sync::OnceCell::new(), 
             config,
             remote_available: Arc::new(AtomicBool::new(true)),
             ui_tx: None,
+            cancel_flag: None,
+            egui_ctx: Arc::new(std::sync::Mutex::new(None)),
         }
     }
     
-    pub fn set_ui_tx(&mut self, tx: tokio::sync::mpsc::Sender<crate::ui::UiEvent>) {
+    pub fn set_ui_tx(&mut self, tx: flume::Sender<crate::ui::UiEvent>) {
         self.ui_tx = Some(tx);
+    }
+    
+    /// Set the shared egui context holder for triggering repaints during streaming
+    pub fn set_egui_ctx(&mut self, ctx: Arc<std::sync::Mutex<Option<eframe::egui::Context>>>) {
+        self.egui_ctx = ctx;
+    }
+    
+    pub fn set_cancel_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.cancel_flag = Some(flag);
+    }
+    
+    /// Check if cancellation was requested
+    fn is_cancelled(&self) -> bool {
+        self.cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed))
     }
     
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
-            let timeout = self.config.timeout_ms.unwrap_or(60000) / 1000;
+            let timeout = self.config.defaults.timeout_ms.unwrap_or(60000) / 1000;
             Client::builder()
                 .timeout(Duration::from_secs(timeout))
                 .tcp_nodelay(true)
@@ -100,17 +205,22 @@ impl LlmClient {
         }).await
     }
     
-    // Helper to get configuration for a specific functionality
-    fn get_func_config(&self, functionality: &str) -> Option<&FunctionalityConfig> {
-        match functionality {
-            "copy_check" => Some(&self.config.copy_check),
-            "translate2c" => Some(&self.config.translate2c),
-            "translate2e" => Some(&self.config.translate2e),
-            "explain" => Some(&self.config.explain),
-            "user_query" => self.config.user_query.as_ref(),
-            "visual" => self.config.visual.as_ref(),
-            _ => None,
-        }
+    // Get action definition by ID
+    fn get_action(&self, action_id: &str) -> Option<&ActionDefinition> {
+        self.config.get_action(action_id)
+    }
+    
+    /// Get the display label for an action
+    pub fn get_action_label(&self, action_id: &str) -> Option<String> {
+        self.get_action(action_id).map(|a| a.label().to_string())
+    }
+    
+    /// Check if an action is a vision action
+    pub fn is_vision_action(&self, action_id: &str) -> bool {
+        self.get_action(action_id)
+            .and_then(|a| a.remote.as_ref())
+            .map(|r| r.is_vision)
+            .unwrap_or(false)
     }
 
     fn expand_env(val: &str) -> String {
@@ -122,52 +232,86 @@ impl LlmClient {
         }
     }
 
-    /// Determines the endpoint, model, and authentication needed for a request.
-    /// 
-    /// Returns: (url, model, needs_auth_key, api_key_if_needed, prompt)
-    fn resolve_config(&self, functionality: &str, force_local: bool) -> Result<(String, String, bool, Option<String>, Option<String>)> {
-        let func_cfg = self.get_func_config(functionality)
-            .ok_or_else(|| anyhow::anyhow!("Unknown functionality: {}", functionality))?;
+    /// Resolves endpoint, model, api_key, prompt, temperature, translation options, and extra params for an action.
+    /// Returns: (url, model, api_key_opt, prompt_opt, temperature, translation_options, extra)
+    fn resolve_action_config(&self, action: &ActionDefinition, force_local: bool) -> Result<(String, String, Option<String>, Option<String>, f32, Option<HashMap<String, String>>, HashMap<String, serde_json::Value>)> {
+        let defaults = &self.config.defaults;
+        let use_local = force_local || self.config.force_local || !self.remote_available.load(Ordering::Relaxed);
 
-        // Check global force_local config OR runtime force_local parameter
-        let use_local = force_local || self.config.force_local;
-        let is_remote = !use_local && self.remote_available.load(Ordering::Relaxed);
-
-        if is_remote {
-            let url = func_cfg.api_url.clone();
-            let base = if url.ends_with("chat/completions") { url } else { format!("{}/chat/completions", url.trim_end_matches('/')) };
-            Ok((
-                base,
-                func_cfg.model.clone(),
-                true,
-                Some(Self::expand_env(&func_cfg.api_key)),
-                func_cfg.prompt.clone(),
-            ))
+        if use_local {
+            // Local config: merge action.local with defaults.local
+            let local_defaults = defaults.local.as_ref();
+            let action_local = action.local.as_ref();
+            
+            let url = action_local.and_then(|l| l.api_url.clone())
+                .or_else(|| local_defaults.and_then(|l| l.api_url.clone()))
+                .ok_or_else(|| anyhow::anyhow!("No local API URL configured for action {}", action.id))?;
+            let url = if url.ends_with("chat/completions") { url } else { format!("{}/chat/completions", url.trim_end_matches('/')) };
+            
+            let model = action_local.and_then(|l| l.model.clone())
+                .or_else(|| local_defaults.and_then(|l| l.model.clone()))
+                .unwrap_or_else(|| "local-model".to_string());
+            
+            let prompt = action_local.and_then(|l| l.prompt.clone())
+                .or_else(|| action.remote.as_ref().and_then(|r| r.prompt.clone()));
+            
+            let temperature = action.remote.as_ref().and_then(|r| r.temperature)
+                .or(defaults.temperature).unwrap_or(0.1);
+            
+            // Collect extra params from local config
+            let extra = action_local.map(|l| l.extra.clone()).unwrap_or_default();
+            
+            Ok((url, model, None, prompt, temperature, None, extra))
         } else {
-             // Local Fallback
-             if let Some(local) = &func_cfg.local {
-                let url = local.api_url.clone();
-                let base = if url.ends_with("chat/completions") { url } else { format!("{}/chat/completions", url.trim_end_matches('/')) };
-                Ok((
-                    base,
-                    local.model.clone(),
-                    false,
-                    None,
-                    local.prompt.clone().or(func_cfg.prompt.clone()), // Fallback to main prompt if local not specific
-                ))
-             } else {
-                 Err(anyhow::anyhow!("No local configuration for {}", functionality))
-             }
+            // Remote config: merge action.remote with defaults
+            let action_remote = action.remote.as_ref();
+            
+            let url = action_remote.and_then(|r| r.api_url.clone())
+                .or_else(|| defaults.api_url.clone())
+                .ok_or_else(|| anyhow::anyhow!("No API URL configured for action {}", action.id))?;
+            let url = if url.ends_with("chat/completions") { url } else { format!("{}/chat/completions", url.trim_end_matches('/')) };
+            
+            let model = action_remote.and_then(|r| r.model.clone())
+                .or_else(|| defaults.model.clone())
+                .unwrap_or_else(|| "gpt-4".to_string());
+            
+            let api_key = action_remote.and_then(|r| r.api_key.clone())
+                .or_else(|| defaults.api_key.clone())
+                .map(|k| Self::expand_env(&k));
+            
+            let prompt = action_remote.and_then(|r| r.prompt.clone());
+            
+            let temperature = action_remote.and_then(|r| r.temperature)
+                .or(defaults.temperature).unwrap_or(0.1);
+            
+            // Build translation options if this is a translation action
+            let translation_options = if action_remote.is_some_and(|r| r.is_translation) {
+                let mut opts: HashMap<String, String> = HashMap::new();
+                if let Some(ref src) = action_remote.and_then(|r| r.source_lang.clone()) {
+                    opts.insert("source_lang".to_string(), src.clone());
+                }
+                if let Some(ref tgt) = action_remote.and_then(|r| r.target_lang.clone()) {
+                    opts.insert("target_lang".to_string(), tgt.clone());
+                }
+                if !opts.is_empty() { Some(opts) } else { None }
+            } else {
+                None
+            };
+            
+            // Collect extra params from remote config
+            let extra = action_remote.map(|r| r.extra.clone()).unwrap_or_default();
+            
+            Ok((url, model, api_key, prompt, temperature, translation_options, extra))
         }
     }
 
     // Spawn health check MUST be called inside a runtime
     pub fn spawn_health_check(self: &Arc<Self>) {
-        // We use copy_check as the canary for health checking
-        let func_cfg = &self.config.copy_check;
-        let url = func_cfg.api_url.clone();
+        // Use the first action or defaults as the canary for health checking
+        let defaults = &self.config.defaults;
+        let url = defaults.api_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let url = if url.ends_with("chat/completions") { url } else { format!("{}/chat/completions", url.trim_end_matches('/')) };
-        let api_key = Self::expand_env(&func_cfg.api_key);
+        let api_key = defaults.api_key.clone().map(|k| Self::expand_env(&k)).unwrap_or_default();
         
         let remote_available = self.remote_available.clone();
 
@@ -216,126 +360,155 @@ impl LlmClient {
         });
     }
 
-    pub async fn chat_completion(&self, functionality: &str, text: &str) -> Result<String> {
+    /// Execute an action by ID with remote/local fallback
+    pub async fn execute_action(&self, action_id: &str, text: &str) -> Result<String> {
+        let action = self.get_action(action_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_id))?
+            .clone();
+        
         // Try remote first
-        let remote_result = match self.resolve_config(functionality, false) {
-            Ok((url, model, _, api_key, prompt)) => {
-                match self.execute_request(&url, &model, api_key, prompt.as_deref(), text, None).await {
+        match self.resolve_action_config(&action, false) {
+            Ok((url, model, api_key, prompt, temperature, translation_options, extra)) => {
+                match self.execute_request(&url, &model, api_key, prompt.as_deref(), text, temperature, translation_options.clone(), extra.clone()).await {
                     Ok(res) => return Ok(res),
                     Err(e) => {
-                        // If it's a network error, mark remote unavailable and try local
                         if is_network_error(&e) {
-                            self.remote_available.store(false, std::sync::atomic::Ordering::Relaxed);
+                            warn!("Remote API failed for {}, falling back to local: {}", action_id, e);
+                            self.remote_available.store(false, Ordering::Relaxed);
                         } else {
                             return Err(e);
                         }
                     }
                 }
             },
-            Err(_) => {} // If config missing, fall through to local
+            Err(e) => {
+                warn!("No remote config for {}: {}", action_id, e);
+            }
         };
+        
         // Try local fallback
-        let (url, model, _, api_key, prompt) = self.resolve_config(functionality, true)?;
-        self.execute_request(&url, &model, api_key, prompt.as_deref(), text, None).await
+        let (url, model, api_key, prompt, temperature, translation_options, extra) = self.resolve_action_config(&action, true)?;
+        self.execute_request(&url, &model, api_key, prompt.as_deref(), text, temperature, translation_options, extra).await
+    }
+
+    /// Legacy chat_completion - maps to execute_action
+    pub async fn chat_completion(&self, action_id: &str, text: &str) -> Result<String> {
+        self.execute_action(action_id, text).await
     }
 
     /// User query with streaming support and remote/local fallback
     pub async fn user_query_streaming(&self, text: &str) -> Result<String> {
-        const FUNCTIONALITY: &str = "user_query";
-        
-        // Try remote first
-        match self.resolve_config(FUNCTIONALITY, false) {
-            Ok((url, model, _, api_key, prompt)) => {
-                match self.execute_request(&url, &model, api_key, prompt.as_deref(), text, None).await {
-                    Ok(res) => return Ok(res),
-                    Err(e) => {
-                        // If it's a network error, mark remote unavailable and try local
-                        if is_network_error(&e) {
-                            warn!("Remote API failed for user_query, falling back to local: {}", e);
-                            self.remote_available.store(false, std::sync::atomic::Ordering::Relaxed);
-                        } else {
-                            // Non-network error, still try local as fallback for robustness
-                            warn!("Remote API error for user_query ({}), attempting local fallback", e);
-                        }
-                    }
-                }
-            },
-            Err(e) => {
-                warn!("No remote config for user_query: {}", e);
-            }
-        };
-        
-        // Try local fallback
-        match self.resolve_config(FUNCTIONALITY, true) {
-            Ok((url, model, _, api_key, prompt)) => {
-                self.execute_request(&url, &model, api_key, prompt.as_deref(), text, None).await
-            },
-            Err(e) => {
-                Err(anyhow::anyhow!("No configuration available for user_query: {}", e))
-            }
-        }
+        self.execute_action("user_query", text).await
     }
 
+    /// Translate text - uses the appropriate translation action based on source/target
     pub async fn translate(&self, text: &str, source: &str, target: &str) -> Result<String> {
-        // Determine functionality key based on languages
-        let functionality = if (source.eq_ignore_ascii_case("English") || source.eq_ignore_ascii_case("en")) && 
-                               (target.eq_ignore_ascii_case("Chinese") || target.eq_ignore_ascii_case("zh")) {
-            "translate2c"
-        } else if (source.eq_ignore_ascii_case("Chinese") || source.eq_ignore_ascii_case("zh")) && 
+        // Determine action ID based on languages
+        let action_id = if (source.eq_ignore_ascii_case("English") || source.eq_ignore_ascii_case("en") || source.eq_ignore_ascii_case("auto")) && 
+                           (target.eq_ignore_ascii_case("Chinese") || target.eq_ignore_ascii_case("zh")) {
+            "translate_e2c"
+        } else if (source.eq_ignore_ascii_case("Chinese") || source.eq_ignore_ascii_case("zh") || source.eq_ignore_ascii_case("auto")) && 
                   (target.eq_ignore_ascii_case("English") || target.eq_ignore_ascii_case("en")) {
-            "translate2e"
+            "translate_c2e"
         } else {
-             // Fallback or generic - technically not supported by current detailed config structure rigidly, 
-             // but we can default to one or fail. Let's try e2c structure as base or just fail.
-             // For now, let's map to E2C config but override prompt? No, prompts are fixed.
-             // We return error for unsupported pairs in this strict mode.
-             return Err(anyhow::anyhow!("Unsupported translation pair for strict config: {} -> {}", source, target));
+            return Err(anyhow::anyhow!("Unsupported translation pair: {} -> {}", source, target));
         };
 
-        // Try remote first
-        let mut options = None;
-        let remote_result = match self.resolve_config(functionality, false) {
-            Ok((url, model, _, api_key, prompt)) => {
-                options = self.get_func_config(functionality).and_then(|c| c.translation_options.clone());
-                match self.execute_request(&url, &model, api_key, prompt.as_deref(), text, options.clone()).await {
-                    Ok(res) => return Ok(res),
-                    Err(e) => {
-                        if is_network_error(&e) {
-                            self.remote_available.store(false, std::sync::atomic::Ordering::Relaxed);
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-            },
-            Err(_) => {}
-        };
-        // Try local fallback
-        let (url, model, _, api_key, prompt) = self.resolve_config(functionality, true)?;
-        options = self.get_func_config(functionality).and_then(|c| c.translation_options.clone());
-        self.execute_request(&url, &model, api_key, prompt.as_deref(), text, options).await
+        self.execute_action(action_id, text).await
     }
 
-// Helper to detect network errors (timeout, connection, DNS, etc)
-fn is_network_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.contains("timed out") || s.contains("connection") || s.contains("dns") || s.contains("unreachable") || s.contains("network")
-}
-
-    async fn execute_request(&self, url: &str, model: &str, api_key: Option<String>, system_prompt: Option<&str>, user_text: &str, translation_options: Option<HashMap<String, String>>) -> Result<String> {
-        let mut messages = Vec::new();
-        if let Some(p) = system_prompt {
-             messages.push(ChatMessage { role: "system".to_string(), content: p.to_string() });
+    /// Execute a vision action with base64-encoded image
+    /// 
+    /// # Arguments
+    /// * `action_id` - The vision action ID (must have `is_vision: true`)
+    /// * `image_base64` - Base64-encoded PNG image data
+    /// 
+    /// # Returns
+    /// Extracted text from the image
+    pub async fn execute_vision_action(&self, action_id: &str, image_base64: &str) -> Result<String> {
+        let action = self.get_action(action_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_id))?
+            .clone();
+        
+        // Get config
+        let (url, model, api_key, prompt, temperature, _, extra) = self.resolve_action_config(&action, false)?;
+        
+        // Get vision-specific params
+        let remote = action.remote.as_ref();
+        let min_pixels = remote.and_then(|r| r.min_pixels);
+        let max_pixels = remote.and_then(|r| r.max_pixels);
+        
+        // Build multimodal content with image and optional prompt
+        let prompt_text = prompt.unwrap_or_else(|| "Extract all text from this image accurately.".to_string());
+        
+        let parts = vec![
+            ContentPart::ImageUrl {
+                image_url: ImageUrlData {
+                    url: format!("data:image/png;base64,{}", image_base64),
+                    min_pixels,
+                    max_pixels,
+                },
+            },
+            ContentPart::Text { text: prompt_text },
+        ];
+        
+        let messages = vec![ChatMessage::user_multimodal(parts)];
+        
+        // Build request (no translation options for vision)
+        let is_stream = self.ui_tx.is_some();
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            translation_options: None,
+            stream: Some(is_stream),
+            extra,
+        };
+        
+        info!("Vision API Request to: {}", url);
+        info!("Model: {}, Stream: {}", model, is_stream);
+        
+        let mut builder = self.get_client().await.post(&url).header("Content-Type", "application/json");
+        if let Some(key) = api_key {
+            builder = builder.header("Authorization", format!("Bearer {}", key));
         }
         
-        // For local API, append /no_think to avoid reasoning output unless user explicitly wants it
-        let user_content = if api_key.is_none() && !user_text.contains("/think") {
+        let res = builder.json(&req).send().await?;
+        
+        let status = res.status();
+        info!("Vision API Response status: {}", status);
+        
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
+            error!("Vision API error response: {}", body);
+            return Err(anyhow::anyhow!("Vision API request failed: {} - {}", status, body));
+        }
+        
+        // Handle streaming/non-streaming response
+        if is_stream {
+            self.stream_sse_response(res, "Vision").await
+        } else {
+            let chat_res: ChatResponse = res.json().await?;
+            chat_res.choices.first()
+                .map(|c| c.message.content.clone())
+                .ok_or_else(|| anyhow::anyhow!("Empty content"))
+        }
+    }
+
+    async fn execute_request(&self, url: &str, model: &str, api_key: Option<String>, prompt: Option<&str>, user_text: &str, temperature: f32, translation_options: Option<HashMap<String, String>>, extra: HashMap<String, serde_json::Value>) -> Result<String> {
+        // Build user content: concatenate prompt with user text as a single user message
+        // This avoids using a system message, per the requirement
+        let user_content = if let Some(p) = prompt {
+            // Concatenate prompt and user text with a clear separator
+            format!("{}\n\n{}", p.trim(), user_text)
+        } else if api_key.is_none() && !user_text.contains("/think") {
+            // For local API, append /no_think to avoid reasoning output unless user explicitly wants it
             format!("{}/no_think", user_text)
         } else {
             user_text.to_string()
         };
         
-        messages.push(ChatMessage { role: "user".to_string(), content: user_content });
+        let messages = vec![ChatMessage::user_text(user_content)];
 
         // Convert HashMap options to TranslationOptions struct if present
         let trans_opts = translation_options.map(|map| {
@@ -350,14 +523,15 @@ fn is_network_error(e: &anyhow::Error) -> bool {
         let req = ChatRequest {
             model: model.to_string(),
             messages,
-            temperature: 0.1,
+            temperature,
             translation_options: trans_opts,
             stream: Some(is_stream),
+            extra,
         };
 
         // Debug logging
         info!("API Request to: {}", url);
-        info!("Model: {}, Stream: {}", model, is_stream);
+        info!("Model: {}, Stream: {}, Temperature: {}", model, is_stream, temperature);
         if let Ok(json_str) = serde_json::to_string_pretty(&req) {
             info!("Request body:\n{}", json_str);
         }
@@ -381,33 +555,90 @@ fn is_network_error(e: &anyhow::Error) -> bool {
         }
 
         if is_stream {
-            use futures_util::StreamExt;
-            let mut stream = res.bytes_stream();
-            let mut full_response = String::new();
-            
-            while let Some(item) = stream.next().await {
-                let chunk = item?;
-                let s = String::from_utf8_lossy(&chunk);
-                // Simple SSE parsing (this is naive but works for standard OpenAI format)
-                for line in s.lines() {
-                    if line.starts_with("data: ") {
-                        let data = &line[6..];
-                        if data == "[DONE]" { break; }
-                        if let Ok(json) = serde_json::from_str::<ChatChunkResponse>(data) {
-                            if let Some(content) = json.choices.first().and_then(|c| c.delta.content.clone()) {
-                                full_response.push_str(&content);
-                                if let Some(tx) = &self.ui_tx {
-                                     let _ = tx.try_send(crate::ui::UiEvent::StreamUpdate(content));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(full_response)
+            self.stream_sse_response(res, "Chat").await
         } else {
             let chat_res: ChatResponse = res.json().await?;
             chat_res.choices.first().map(|c| c.message.content.clone()).ok_or_else(|| anyhow::anyhow!("Empty content"))
         }
+    }
+
+    /// Stream SSE response with proper buffering using eventsource-stream.
+    ///
+    /// This method correctly handles SSE events that may be split across TCP chunks,
+    /// ensuring no content is lost due to chunk boundary misalignment.
+    async fn stream_sse_response(
+        &self,
+        res: reqwest::Response,
+        context_label: &str,
+    ) -> Result<String> {
+        let mut stream = res.bytes_stream().eventsource();
+        let mut full_response = String::new();
+        let mut event_count = 0;
+
+        while let Some(event_result) = stream.next().await {
+            // Check for cancellation at start of each event
+            if self.is_cancelled() {
+                info!("{} request cancelled by user after {} events", context_label, event_count);
+                return Err(anyhow::anyhow!("Cancelled"));
+            }
+
+            match event_result {
+                Ok(event) => {
+                    event_count += 1;
+                    let data = &event.data;
+                    
+                    // Check for stream completion
+                    if data == "[DONE]" {
+                        info!("{} stream complete after {} events, total length: {}", 
+                              context_label, event_count, full_response.len());
+                        break;
+                    }
+
+                    // Parse the JSON chunk
+                    match serde_json::from_str::<ChatChunkResponse>(data) {
+                        Ok(json) => {
+                            if let Some(content) = json.choices.first().and_then(|c| c.delta.content.clone()) {
+                                debug!("{} SSE event {}: {} bytes", context_label, event_count, content.len());
+                                full_response.push_str(&content);
+                                if let Some(tx) = &self.ui_tx {
+                                    if let Err(e) = tx.try_send(crate::ui::UiEvent::StreamUpdate(content)) {
+                                        warn!("Failed to send StreamUpdate: {}", e);
+                                    }
+                                    // Clone context before releasing lock to avoid holding it during repaint
+                                    let ctx_clone = self.egui_ctx.lock().ok().and_then(|g| g.clone());
+                                    if let Some(ctx) = ctx_clone {
+                                        ctx.request_repaint();
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Log parse errors but continue - some events may be heartbeats or metadata
+                            debug!("{} SSE JSON parse error (event {}): {} - data: {}", 
+                                   context_label, event_count, e, data);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Log SSE-level errors and continue
+                    warn!("{} SSE parse error: {}", context_label, e);
+                }
+            }
+        }
+
+        info!("{} streaming finished: {} events received, response length: {}", 
+              context_label, event_count, full_response.len());
+        
+        // Send StreamEnd to signal completion to the UI
+        if let Some(tx) = &self.ui_tx {
+            let _ = tx.try_send(crate::ui::UiEvent::StreamEnd(true));
+            // Wake up UI to process the end event
+            let ctx_clone = self.egui_ctx.lock().ok().and_then(|g| g.clone());
+            if let Some(ctx) = ctx_clone {
+                ctx.request_repaint();
+            }
+        }
+        
+        Ok(full_response)
     }
 }

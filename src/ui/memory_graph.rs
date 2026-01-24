@@ -1,8 +1,8 @@
 use crate::core::memory::*;
-use crate::core::memory_store::MemoryStore;
+// use crate::core::memory_store::MemoryStore; // REMOVE
+use crate::core::ipc_messages::GraphRequest;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use uuid::Uuid;
 
 const NODE_RADIUS: f32 = 35.0;
@@ -18,20 +18,21 @@ struct GhostNode {
 }
 
 pub struct MemoryGraphView {
-    store: Arc<MemoryStore>,
+    // store: Arc<MemoryStore>, // REMOVE
     // Cached data
     cached_items: Vec<MemoryItem>,
     cached_edges: Vec<MemoryEdge>,
     ghost_nodes: HashMap<Uuid, GhostNode>,
-    last_revision: u64,
-    // Per-tier limits
+    // last_revision: u64, // REMOVE
+    
+    // Per-tier limits (client-side filter only, or maybe request params later)
     short_term_limit: usize,
     mid_term_limit: usize,
     long_term_limit: usize,
     // Layout
     node_positions: HashMap<Uuid, Pos2>,
     // UI state
-    selected_node: Option<Uuid>,
+    selected_nodes: HashSet<Uuid>,
     hovered_node: Option<Uuid>,
     dragging_node: Option<Uuid>,
     drag_offset: Vec2,
@@ -45,21 +46,40 @@ pub struct MemoryGraphView {
     // Title editing state (persist across frames)
     title_edit_id: Option<Uuid>,
     title_edit_buffer: String,
+    title_edit_dirty: bool,
+    
+    // Marquee (Shift+Drag) selection state
+    marquee_start: Option<Pos2>,
+    marquee_current: Option<Pos2>,
+    
+    // Auto-align flag: when true, ignore persisted positions on next reflow
+    force_default_layout: bool,
+    
+    // Export feedback for user (time, message, is_success)
+    export_feedback: Option<(std::time::Instant, String, bool)>,
+    
+    // Configured export path (from config)
+    export_path: Option<String>,
+    
+    // IPC
+    mutations: Vec<GraphRequest>,
 }
 
 impl MemoryGraphView {
-    pub fn new(store: Arc<MemoryStore>) -> Self {
+    pub fn new() -> Self {
+        Self::new_with_export_path(None)
+    }
+    
+    pub fn new_with_export_path(export_path: Option<String>) -> Self {
         Self {
-            store,
             cached_items: Vec::new(),
             cached_edges: Vec::new(),
             ghost_nodes: HashMap::new(),
-            last_revision: 0,
             short_term_limit: DEFAULT_LIMIT_PER_TIER,
             mid_term_limit: DEFAULT_LIMIT_PER_TIER,
             long_term_limit: DEFAULT_LIMIT_PER_TIER,
             node_positions: HashMap::new(),
-            selected_node: None,
+            selected_nodes: HashSet::new(),
             hovered_node: None,
             dragging_node: None,
             drag_offset: Vec2::ZERO,
@@ -72,54 +92,71 @@ impl MemoryGraphView {
             search_query: String::new(),
             title_edit_id: None,
             title_edit_buffer: String::new(),
+            title_edit_dirty: false,
+            marquee_start: None,
+            marquee_current: None,
+            force_default_layout: false,
+            export_feedback: None,
+            export_path,
+            mutations: Vec::new(),
         }
     }
 
-    /// Refresh cache if revision changed
-    fn refresh_cache_if_needed(&mut self) {
-        let current_rev = self.store.get_revision();
-        if current_rev == self.last_revision && !self.cached_items.is_empty() {
-            return;
-        }
-        self.last_revision = current_rev;
-
-        // Load items by tier with limits
-        let short_items = self.store.list_items_by_type(MemoryType::ShortTerm, self.short_term_limit, 0);
-        let mid_items = self.store.list_items_by_type(MemoryType::MidTerm, self.mid_term_limit, 0);
-        let long_items = self.store.list_items_by_type(MemoryType::LongTerm, self.long_term_limit, 0);
-
-        self.cached_items = short_items.into_iter()
-            .chain(mid_items)
-            .chain(long_items)
-            .collect();
-
-        // Get edges for visible items
-        let item_ids: HashSet<Uuid> = self.cached_items.iter().map(|i| i.id).collect();
-        self.cached_edges = self.store.list_edges_for_items(&item_ids);
-
-        // Find ghost nodes (edges referencing missing sources)
-        self.ghost_nodes.clear();
-        for edge in &self.cached_edges {
-            if !item_ids.contains(&edge.source_id) && !self.store.item_exists(edge.source_id) {
-                // This is a dangling edge - source is gone
-                if !self.ghost_nodes.contains_key(&edge.source_id) {
-                    self.ghost_nodes.insert(edge.source_id, GhostNode {
-                        id: edge.source_id,
-                        position: Pos2::new(-300.0, 0.0), // Will be positioned in layout
-                    });
-                }
+    pub fn set_data(&mut self, items: Vec<MemoryItem>, edges: Vec<MemoryEdge>) {
+        // Debug: log items with titles
+        for item in &items {
+            if item.title.is_some() {
+                log::debug!("set_data: received item {} with title {:?}", item.id, item.title);
             }
         }
+        
+        let item_ids: std::collections::HashSet<_> = items.iter().map(|i| i.id).collect();
+        self.cached_items = items;
+        // Filter out edges with missing endpoints to prevent crashes
+        self.cached_edges = edges
+            .into_iter()
+            .filter(|e| item_ids.contains(&e.source_id) && item_ids.contains(&e.target_id))
+            .collect();
+        self.refresh_ghost_nodes();
+        self.reflow_layout(); // Recalculate layout with new data
+    }
 
+    pub fn drain_mutations(&mut self) -> Vec<GraphRequest> {
+        self.mutations.drain(..).collect()
+    }
+
+    fn refresh_ghost_nodes(&mut self) {
+         let item_ids: HashSet<Uuid> = self.cached_items.iter().map(|i| i.id).collect();
+         self.ghost_nodes.clear();
+         for edge in &self.cached_edges {
+             // Handle missing source
+             if !item_ids.contains(&edge.source_id) {
+                 if !self.ghost_nodes.contains_key(&edge.source_id) {
+                     self.ghost_nodes.insert(edge.source_id, GhostNode {
+                         id: edge.source_id,
+                         position: Pos2::new(-300.0, 0.0),
+                     });
+                 }
+             }
+             // Handle missing target
+             if !item_ids.contains(&edge.target_id) {
+                 if !self.ghost_nodes.contains_key(&edge.target_id) {
+                     self.ghost_nodes.insert(edge.target_id, GhostNode {
+                         id: edge.target_id,
+                         position: Pos2::new(-300.0, 50.0),
+                     });
+                 }
+             }
+         }
+         
         // Prune stale node positions
         let valid_ids: HashSet<Uuid> = item_ids.iter().copied()
             .chain(self.ghost_nodes.keys().copied())
             .collect();
         self.node_positions.retain(|id, _| valid_ids.contains(id));
-
-        // Recompute layout
-        self.reflow_layout();
     }
+    
+    // REMOVED refresh_cache_if_needed
 
     /// Recompute tier-stacked layout (short left, mid center, long right)
     fn reflow_layout(&mut self) {
@@ -149,38 +186,52 @@ impl MemoryGraphView {
         });
 
         // Position nodes (newest at top, y=0)
-        // If an item has a persisted position, honor it.
-        // Otherwise, keep an existing in-session position if present (e.g., dragged short-term nodes).
+        // If force_default_layout is set, ignore persisted positions.
+        // Otherwise, honor item.position from server, then session positions, then default.
+        let ignore_persisted = self.force_default_layout;
+        
         for (idx, item) in short_items.iter().enumerate() {
             let default_y = idx as f32 * NODE_SPACING_Y;
             let default_pos = Pos2::new(x_short, default_y);
-            let new_pos = item
-                .position
-                .map(|(x, y)| Pos2::new(x, y))
-                .or_else(|| self.node_positions.get(&item.id).copied())
-                .unwrap_or(default_pos);
+            let new_pos = if ignore_persisted {
+                default_pos
+            } else {
+                item.position
+                    .map(|(x, y)| Pos2::new(x, y))
+                    .or_else(|| self.node_positions.get(&item.id).copied())
+                    .unwrap_or(default_pos)
+            };
             self.node_positions.insert(item.id, new_pos);
         }
         for (idx, item) in mid_items.iter().enumerate() {
             let default_y = idx as f32 * NODE_SPACING_Y;
             let default_pos = Pos2::new(x_mid, default_y);
-            let new_pos = item
-                .position
-                .map(|(x, y)| Pos2::new(x, y))
-                .or_else(|| self.node_positions.get(&item.id).copied())
-                .unwrap_or(default_pos);
+            let new_pos = if ignore_persisted {
+                default_pos
+            } else {
+                item.position
+                    .map(|(x, y)| Pos2::new(x, y))
+                    .or_else(|| self.node_positions.get(&item.id).copied())
+                    .unwrap_or(default_pos)
+            };
             self.node_positions.insert(item.id, new_pos);
         }
         for (idx, item) in long_items.iter().enumerate() {
             let default_y = idx as f32 * NODE_SPACING_Y;
             let default_pos = Pos2::new(x_long, default_y);
-            let new_pos = item
-                .position
-                .map(|(x, y)| Pos2::new(x, y))
-                .or_else(|| self.node_positions.get(&item.id).copied())
-                .unwrap_or(default_pos);
+            let new_pos = if ignore_persisted {
+                default_pos
+            } else {
+                item.position
+                    .map(|(x, y)| Pos2::new(x, y))
+                    .or_else(|| self.node_positions.get(&item.id).copied())
+                    .unwrap_or(default_pos)
+            };
             self.node_positions.insert(item.id, new_pos);
         }
+        
+        // Reset the flag after applying
+        self.force_default_layout = false;
 
         // Position ghost nodes in a separate area
         for (idx, ghost) in self.ghost_nodes.values_mut().enumerate() {
@@ -208,10 +259,20 @@ impl MemoryGraphView {
         }
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Refresh cache if store revision changed
-        self.refresh_cache_if_needed();
+    // Truncate a label by Unicode scalar characters (works reasonably for CJK)
+    fn truncate_label(s: &str, max_chars: usize) -> String {
+        let count = s.chars().count();
+        if count <= max_chars {
+            s.to_string()
+        } else {
+            let truncated: String = s.chars().take(max_chars).collect();
+            format!("{}…", truncated)
+        }
+    }
 
+    pub fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Cache refresh is now driven by external data setter
+       
         // Top toolbar
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_short_term, "📋 Short-term");
@@ -227,7 +288,31 @@ impl MemoryGraphView {
             ui.separator();
             
             if ui.button("Auto Align").clicked() {
+                // Set flag to ignore persisted positions on next reflow
+                self.force_default_layout = true;
+                self.node_positions.clear();
+                // Clear server-side positions so they don't overwrite on next snapshot
+                self.mutations.push(GraphRequest::ClearAllPositions);
                 self.reflow_layout();
+            }
+            if ui.button("Export").clicked() {
+                self.export_graph(None);
+            }
+            
+            // Show export feedback (fades after 3 seconds)
+            if let Some((time, ref msg, is_success)) = self.export_feedback {
+                let elapsed = time.elapsed().as_secs_f32();
+                if elapsed < 3.0 {
+                    let alpha = ((3.0 - elapsed) / 3.0 * 255.0) as u8;
+                    let color = if is_success {
+                        Color32::from_rgba_unmultiplied(100, 255, 100, alpha)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 100, 100, alpha)
+                    };
+                    ui.colored_label(color, msg);
+                } else {
+                    self.export_feedback = None;
+                }
             }
             
             if self.edge_creation_source.is_some() {
@@ -247,6 +332,7 @@ impl MemoryGraphView {
             ui.separator();
             ui.colored_label(Color32::from_rgb(255, 100, 255), "→ Translated");
             ui.colored_label(Color32::from_rgb(100, 200, 255), "→ Explained");
+            ui.colored_label(Color32::from_rgb(255, 150, 100), "→ Formatted");
             ui.colored_label(Color32::from_rgb(0, 255, 100), "→ Promoted");
         });
 
@@ -259,21 +345,21 @@ impl MemoryGraphView {
             ui.label(format!("📋 Short: {}", short_count));
             if ui.small_button("+10").clicked() {
                 self.short_term_limit += 10;
-                self.last_revision = 0; // Force refresh
+                // Client must assume next snapshot request will honor this, 
+                // but for now we rely on the main process to just send what it sends.
+                // We should probably send component limits in GetSnapshot if we want this.
             }
             ui.separator();
             
             ui.label(format!("🔄 Mid: {}", mid_count));
             if ui.small_button("+10").clicked() {
                 self.mid_term_limit += 10;
-                self.last_revision = 0;
             }
             ui.separator();
             
             ui.label(format!("💾 Long: {}", long_count));
             if ui.small_button("+10").clicked() {
                 self.long_term_limit += 10;
-                self.last_revision = 0;
             }
         });
 
@@ -284,8 +370,8 @@ impl MemoryGraphView {
         let (response, painter) = ui.allocate_painter(available_size, Sense::click_and_drag());
         let rect = response.rect;
 
-        // Handle panning
-        if response.dragged() && self.dragging_node.is_none() {
+        // Handle panning - but NOT during marquee selection or node dragging
+        if response.dragged() && self.dragging_node.is_none() && self.marquee_start.is_none() {
             self.view_offset += response.drag_delta();
         }
 
@@ -358,15 +444,18 @@ impl MemoryGraphView {
                     continue;
                 }
 
-                // Draw a short stub (no arrowheads). If nodes overlap, use a default direction.
+                // Draw a full edge line (no arrowheads). Guard against near-zero length deltas.
                 let delta = to_screen - from_screen;
                 let len_sq = delta.length_sq();
-                let dir = if len_sq > 1.0e-6 { delta / len_sq.sqrt() } else { Vec2::X };
+                if len_sq < 1.0 {
+                    // Overlapping or extremely close nodes — skip drawing this edge to avoid numerical issues
+                    continue;
+                }
+                let dir = delta / len_sq.sqrt();
 
                 let node_radius = NODE_RADIUS * self.zoom;
                 let start = from_screen + dir * node_radius;
-                let stub_len = (18.0 * self.zoom).max(6.0);
-                let end = start + dir * stub_len;
+                let end = to_screen - dir * node_radius;
 
                 let color = self.get_edge_color(edge.relation);
                 painter.line_segment([start, end], Stroke::new(2.0 * self.zoom, color));
@@ -409,7 +498,7 @@ impl MemoryGraphView {
                     self.hovered_node = Some(item.id);
                 }
 
-                let is_selected = self.selected_node == Some(item.id);
+                let is_selected = self.selected_nodes.contains(&item.id);
                 let is_edge_source = self.edge_creation_source == Some(item.id);
                 let base_color = self.get_node_color(item.memory_type);
 
@@ -434,14 +523,19 @@ impl MemoryGraphView {
                 painter.circle_filled(screen_pos, node_radius, fill_color);
                 painter.circle_stroke(screen_pos, node_radius, Stroke::new(2.0, Color32::WHITE));
 
-                // Label: prefer title, otherwise preview (truncate to fit)
-                let text_source = item.title.as_deref().filter(|s| !s.trim().is_empty()).map(|s| s.to_string()).unwrap_or_else(|| item.preview.clone());
-                let truncated: String = text_source.chars().take(15).collect();
-                let label = if truncated.len() < text_source.len() {
-                    format!("{}...", truncated)
+                // Label: prefer full title; otherwise show first 3 words of content
+                let raw_label = if let Some(t) = item.title.as_deref().filter(|s| !s.trim().is_empty()) {
+                    t.to_string()
                 } else {
-                    truncated
+                    let words: Vec<&str> = item.content.split_whitespace().collect();
+                    if words.len() <= 3 {
+                        words.join(" ")
+                    } else {
+                        words[..3].join(" ")
+                    }
                 };
+                // Ensure labels are bounded in characters (handles CJK where whitespace splitting fails)
+                let label = Self::truncate_label(&raw_label, 12);
                 painter.text(
                     screen_pos,
                     egui::Align2::CENTER_CENTER,
@@ -472,25 +566,98 @@ impl MemoryGraphView {
             );
         }
 
-        // Handle interactions
+        // Draw marquee selection rectangle
+        if let (Some(start), Some(current)) = (self.marquee_start, self.marquee_current) {
+            let screen_start = self.world_to_screen(start, rect);
+            let screen_current = self.world_to_screen(current, rect);
+            let marquee_rect = Rect::from_two_pos(screen_start, screen_current);
+            
+            // Semi-transparent fill
+            painter.rect_filled(
+                marquee_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(100, 150, 255, 40),
+            );
+            // Border
+            painter.rect_stroke(
+                marquee_rect,
+                0.0,
+                Stroke::new(1.5, Color32::from_rgb(100, 150, 255)),
+            );
+        }
+
+        // Match interactions
         if response.clicked() {
             if let Some(hovered) = self.hovered_node {
                 if let Some(source) = self.edge_creation_source {
                     if source != hovered {
-                        self.store.add_user_edge(source, hovered);
+                        self.mutations.push(GraphRequest::AddUserEdge { source, target: hovered });
                     }
                     self.edge_creation_source = None;
                 } else {
-                    self.selected_node = Some(hovered);
+                    // Multi-select with Ctrl+Click
+                    let ctrl_held = ui.input(|i| i.modifiers.ctrl);
+                    if ctrl_held {
+                        // Toggle selection
+                        if self.selected_nodes.contains(&hovered) {
+                            self.selected_nodes.remove(&hovered);
+                        } else {
+                            self.selected_nodes.insert(hovered);
+                        }
+                    } else {
+                        // Single click: clear and select one
+                        self.selected_nodes.clear();
+                        self.selected_nodes.insert(hovered);
+                    }
                 }
             } else {
-                self.selected_node = None;
+                self.selected_nodes.clear();
                 self.edge_creation_source = None;
             }
         }
 
-        if response.drag_started() {
+        // Right-click context menu for delete
+        if response.secondary_clicked() {
             if let Some(hovered) = self.hovered_node {
+                // Ensure right-clicked node is selected
+                if !self.selected_nodes.contains(&hovered) {
+                    self.selected_nodes.clear();
+                    self.selected_nodes.insert(hovered);
+                }
+            }
+        }
+        
+        // Context menu popup
+        response.context_menu(|ui| {
+            if !self.selected_nodes.is_empty() {
+                let count = self.selected_nodes.len();
+                let label = if count == 1 {
+                    "🗑 Delete item".to_string()
+                } else {
+                    format!("🗑 Delete {} items", count)
+                };
+                if ui.button(label).clicked() {
+                    for id in self.selected_nodes.drain() {
+                        self.mutations.push(GraphRequest::DeleteItem { id });
+                    }
+                    self.title_edit_id = None;
+                    self.title_edit_buffer.clear();
+                    self.title_edit_dirty = false;
+                    ui.close_menu();
+                }
+            }
+        });
+
+        if response.drag_started() {
+            let shift_held = ui.input(|i| i.modifiers.shift);
+            if shift_held && self.hovered_node.is_none() {
+                // Shift+Drag on empty area: start marquee selection
+                if let Some(pointer) = pointer_pos {
+                    self.marquee_start = Some(self.screen_to_world(pointer, rect));
+                    self.marquee_current = self.marquee_start;
+                }
+            } else if let Some(hovered) = self.hovered_node {
+                // Drag on a node: move it
                 self.dragging_node = Some(hovered);
                 if let Some(&pos) = self.node_positions.get(&hovered) {
                     let screen_pos = self.world_to_screen(pos, rect);
@@ -500,7 +667,12 @@ impl MemoryGraphView {
         }
 
         if response.dragged() {
-            if let Some(dragging) = self.dragging_node {
+            if self.marquee_start.is_some() {
+                // Update marquee rectangle
+                if let Some(pointer) = pointer_pos {
+                    self.marquee_current = Some(self.screen_to_world(pointer, rect));
+                }
+            } else if let Some(dragging) = self.dragging_node {
                 if let Some(pointer) = pointer_pos {
                     let new_screen_pos = pointer - self.drag_offset;
                     let new_world_pos = self.screen_to_world(new_screen_pos, rect);
@@ -510,25 +682,60 @@ impl MemoryGraphView {
         }
 
         if response.drag_stopped() {
-            // Persist node position only when drag ends.
-            if let Some(dragging) = self.dragging_node.take() {
-                if self.store.item_exists(dragging) {
-                    if let Some(&pos) = self.node_positions.get(&dragging) {
-                        self.store.update_item_position(dragging, pos.x, pos.y);
+            if let (Some(start), Some(end)) = (self.marquee_start.take(), self.marquee_current.take()) {
+                // Finalize marquee selection
+                let min_x = start.x.min(end.x);
+                let max_x = start.x.max(end.x);
+                let min_y = start.y.min(end.y);
+                let max_y = start.y.max(end.y);
+                let selection_rect = Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y));
+                
+                let ctrl_held = ui.input(|i| i.modifiers.ctrl);
+                if !ctrl_held {
+                    self.selected_nodes.clear();
+                }
+                
+                // Find all nodes inside the rectangle
+                for item in &self.cached_items {
+                    if let Some(&pos) = self.node_positions.get(&item.id) {
+                        if selection_rect.contains(pos) {
+                            self.selected_nodes.insert(item.id);
+                        }
                     }
+                }
+            } else if let Some(dragging) = self.dragging_node.take() {
+                // Persist node position only when drag ends.
+                if let Some(pos) = self.node_positions.get(&dragging).copied() {
+                    // Instead of direct DB update, send mutation request
+                    self.mutations.push(GraphRequest::UpdateNodePosition { id: dragging, x: pos.x, y: pos.y });
                 }
             }
         }
 
-        // ESC to cancel edge creation
+        // ESC to cancel edge creation / clear selection
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.edge_creation_source = None;
-            self.selected_node = None;
+            self.selected_nodes.clear();
+            self.title_edit_id = None;
+            self.title_edit_buffer.clear();
+            self.title_edit_dirty = false;
         }
 
-        // Selected node details panel
-        if let Some(selected_id) = self.selected_node {
-            if let Some(item) = self.store.get_item(selected_id) {
+        // Delete key to delete selected nodes
+        if ui.input(|i| i.key_pressed(egui::Key::Delete)) && !self.selected_nodes.is_empty() {
+            for id in self.selected_nodes.drain() {
+                self.mutations.push(GraphRequest::DeleteItem { id });
+            }
+            self.title_edit_id = None;
+            self.title_edit_buffer.clear();
+            self.title_edit_dirty = false;
+        }
+
+        // Selected node details panel (only when exactly one node is selected)
+        if self.selected_nodes.len() == 1 {
+            let selected_id = *self.selected_nodes.iter().next().unwrap();
+            // Find item in cache instead of store.get_item
+            if let Some(item) = self.cached_items.iter().find(|i| i.id == selected_id).cloned() {
                 self.draw_details_panel(ui, &item);
             }
         }
@@ -561,7 +768,7 @@ impl MemoryGraphView {
                 match &item.metadata {
                     MemoryMetadata::ActionResult { action_type, .. } => {
                         let action_str = match action_type {
-                            ActionType::Format => "Copy Check / Format",
+                            ActionType::Format => "Format",
                             ActionType::TranslateE2C => "Translation (EN→中)",
                             ActionType::TranslateC2E => "Translation (中→EN)",
                             ActionType::Explain => "Explanation",
@@ -573,9 +780,21 @@ impl MemoryGraphView {
                 }
 
                 ui.separator();
-                // Editable title
+                // Editable title - only reset buffer when switching to a different item AND not dirty
                 if self.title_edit_id != Some(item.id) {
+                    // Switching to a new item: reset buffer
                     self.title_edit_id = Some(item.id);
+                    self.title_edit_buffer = item.title.clone().unwrap_or_default();
+                    self.title_edit_dirty = false;
+                } else if self.title_edit_dirty {
+                    // Dirty: check if server confirmed our update (titles match)
+                    let server_title = item.title.clone().unwrap_or_default();
+                    if server_title == self.title_edit_buffer {
+                        self.title_edit_dirty = false; // Server confirmed
+                    }
+                    // Otherwise keep our local buffer
+                } else {
+                    // Not dirty: sync with server data
                     self.title_edit_buffer = item.title.clone().unwrap_or_default();
                 }
 
@@ -583,22 +802,43 @@ impl MemoryGraphView {
                     ui.label("Title:");
                     let title_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.title_edit_buffer)
-                            .desired_width(240.0)
-                            .hint_text("Optional title (Enter to save)"),
+                            .desired_width(200.0)
+                            .hint_text("Optional title"),
                     );
 
-                    // Save on Enter only.
+                    // Track if user modified the buffer
+                    if title_resp.changed() {
+                        self.title_edit_dirty = true;
+                    }
+
+                    // Save button
+                    if ui.button("💾").on_hover_text("Save title").clicked() {
+                        eprintln!("Save button clicked, pushing UpdateItemTitle for {}", item.id);
+                        self.mutations.push(GraphRequest::UpdateItemTitle { 
+                            id: item.id, 
+                            title: self.title_edit_buffer.clone() 
+                        });
+                    }
+
+                    // Title is saved when Enter is pressed while focused, then focus is surrendered.
                     if title_resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        self.store.update_item_title(item.id, self.title_edit_buffer.clone());
+                        eprintln!("Enter pressed, pushing UpdateItemTitle for {}", item.id);
+                        self.mutations.push(GraphRequest::UpdateItemTitle { 
+                            id: item.id, 
+                            title: self.title_edit_buffer.clone() 
+                        });
                         ui.ctx().memory_mut(|mem| mem.surrender_focus(title_resp.id));
                     }
                 });
 
                 ui.label("Content:");
+                // Avoid cloning large content if possible, but egui needs mutable ref or we copy.
+                // Cloning string is fine for UI loop for now.
+                let mut content = item.content.clone();
                 egui::ScrollArea::vertical()
                     .max_height(200.0)
                     .show(ui, |ui| {
-                        ui.add(egui::TextEdit::multiline(&mut item.content.clone())
+                        ui.add(egui::TextEdit::multiline(&mut content)
                             .desired_width(f32::INFINITY)
                             .interactive(false));
                     });
@@ -608,16 +848,20 @@ impl MemoryGraphView {
                 ui.horizontal(|ui| {
                     if item.memory_type != MemoryType::MidTerm {
                         if ui.button("→ Mid").clicked() {
-                            if let Ok(new_id) = self.store.clone_promote_item(item.id, MemoryType::MidTerm) {
-                                self.selected_node = Some(new_id);
-                            }
+                            self.mutations.push(GraphRequest::PromoteItem {
+                                id: item.id,
+                                target_type: MemoryType::MidTerm
+                            });
+                             // Selection update should happen after refresh, but we can't easily predict the new ID.
+                             // Client will receive new snapshot.
                         }
                     }
                     if item.memory_type != MemoryType::LongTerm {
                         if ui.button("→ Long").clicked() {
-                            if let Ok(new_id) = self.store.clone_promote_item(item.id, MemoryType::LongTerm) {
-                                self.selected_node = Some(new_id);
-                            }
+                             self.mutations.push(GraphRequest::PromoteItem {
+                                id: item.id,
+                                target_type: MemoryType::LongTerm
+                            });
                         }
                     }
                 });
@@ -630,21 +874,61 @@ impl MemoryGraphView {
                         ui.ctx().copy_text(item.content.clone());
                     }
                     if ui.button("🗑 Delete").clicked() {
-                        let _ = self.store.delete_item(item.id);
-                        self.selected_node = None;
+                        self.mutations.push(GraphRequest::DeleteItem { id: item.id });
+                        self.selected_nodes.clear();
+                        self.title_edit_id = None;
+                        self.title_edit_buffer.clear();
+                        self.title_edit_dirty = false;
                     }
                 });
             });
     }
 
-    fn reset_layout(&mut self) {
-        self.node_positions.clear();
-        self.view_offset = Vec2::ZERO;
-        self.zoom = 1.0;
-        self.short_term_limit = DEFAULT_LIMIT_PER_TIER;
-        self.mid_term_limit = DEFAULT_LIMIT_PER_TIER;
-        self.long_term_limit = DEFAULT_LIMIT_PER_TIER;
-        self.last_revision = 0; // Force cache refresh
+    pub fn export_graph(&mut self, path: Option<std::path::PathBuf>) {
+        use chrono::Utc;
+        use std::fs::File;
+        use std::io::Write;
+
+        // Serialize synchronously for immediate feedback
+        let payload = serde_json::json!({ "items": self.cached_items, "edges": self.cached_edges });
+        let data = match serde_json::to_string_pretty(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                self.export_feedback = Some((std::time::Instant::now(), format!("Export failed: {}", e), false));
+                return;
+            }
+        };
+
+        let out_path = match path {
+            Some(p) => p,
+            None => {
+                // Use configured export_path, fall back to Downloads
+                let mut dir = if let Some(ref configured) = self.export_path {
+                    std::path::PathBuf::from(configured)
+                } else {
+                    dirs::download_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+                };
+                let ts = Utc::now().format("%Y%m%d_%H%M%S");
+                dir.push(format!("memory_graph_{}.json", ts));
+                dir
+            }
+        };
+
+        match File::create(&out_path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(data.as_bytes()) {
+                    self.export_feedback = Some((std::time::Instant::now(), format!("Write failed: {}", e), false));
+                } else {
+                    let filename = out_path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file");
+                    self.export_feedback = Some((std::time::Instant::now(), format!("✓ Saved: {}", filename), true));
+                }
+            }
+            Err(e) => {
+                self.export_feedback = Some((std::time::Instant::now(), format!("Create failed: {}", e), false));
+            }
+        }
     }
 
     fn world_to_screen(&self, world_pos: Pos2, rect: Rect) -> Pos2 {

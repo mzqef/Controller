@@ -1,0 +1,208 @@
+# IntelliBoard AI Actions Configuration
+# ============================================================================
+# Define custom AI-powered functions that can be triggered via hotkeys.
+# Each action can have separate remote and local API configurations.
+#
+# STRUCTURE:
+#   [[actions]]           - Defines a new action
+#   [actions.remote]      - Remote API settings for THIS action (optional)
+#   [actions.local]       - Local LLM fallback for THIS action (optional)
+#
+# NOTE: [actions.remote] and [actions.local] MUST immediately follow their
+#       [[actions]] block. Order matters in TOML!
+#
+# HOT-RELOAD: Changes are applied automatically without restarting.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Global Defaults
+# ----------------------------------------------------------------------------
+# These settings apply to all actions unless overridden per-action.
+
+[defaults]
+api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+api_key = "${API_KEY}"
+model = "qwen-max"
+temperature = 0.1
+timeout_ms = 60000
+
+[defaults.local]
+api_url = "http://127.0.0.1:8000/api/v1/chat/completions"
+model = "Qwen3-4B-Hybrid"
+
+# Force local LLM for all actions (set to true for offline mode)
+force_local = false
+
+# ============================================================================
+# ACTION DEFINITIONS
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Format - Fix PDF text and format math
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "format"
+label = "Format"
+description = "Fix PDF text and format math"
+
+[actions.remote]
+prompt = """You are a helpful assistant that fixes text copied from PDFs.
+Your task is to:
+1. Replace ligatures (e.g., 'ﬁ' -> 'fi', 'ﬂ' -> 'fl') with standard characters.
+2. Fix broken ligatures (e.g., 'classiWcation' -> 'classification', 'Wction' -> 'fiction').
+3. Correct any typos.
+4. Format mathematical formulas using LaTeX syntax enclosed in $ for inline or $$ for block.
+5. Remove unnecessary line breaks that occur in the middle of sentences.
+6. Return ONLY the corrected text. Do not add any conversational filler."""
+
+[actions.local]
+prompt = """Fix this PDF text:
+1. Replace ligatures and fix broken ligatures
+2. Correct any typos.
+3. Format math with LaTeX ($...$)
+4. Remove mid-sentence line breaks
+Return ONLY the fixed text. NO EXPLANATION."""
+
+# ----------------------------------------------------------------------------
+# Translate English → Chinese
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "translate_e2c"
+label = "Translate E→C"
+description = "Translate English to Chinese"
+
+[actions.remote]
+model = "qwen-mt-flash"
+is_translation = true
+source_lang = "auto"
+target_lang = "Chinese"
+# No prompt needed - translation API handles it
+
+[actions.local]
+prompt = "Translate the following text to Chinese. NO EXPLANATION. Return ONLY the translation:\n\n"
+
+# ----------------------------------------------------------------------------
+# Translate Chinese → English
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "translate_c2e"
+label = "Translate C→E"
+description = "Translate Chinese to English"
+
+[actions.remote]
+model = "qwen-mt-flash"
+is_translation = true
+source_lang = "auto"
+target_lang = "English"
+# No prompt needed - translation API handles it
+
+[actions.local]
+prompt = "Translate the following text to English. NO EXPLANATION. Return ONLY the translation:\n\n"
+
+# ----------------------------------------------------------------------------
+# Explain - Explain selected text
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "explain"
+label = "Explain"
+description = "Explain selected text"
+
+[actions.remote]
+prompt = "Explain the following text clearly and concisely. If it contains code, explain the logic. If it contains a concept, explain the definition."
+
+[actions.local]
+prompt = "Explain the following text concisely."
+
+# ----------------------------------------------------------------------------
+# User Query - Free-form input (hidden from hotkey dropdown)
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "user_query"
+label = "User Query"
+description = "Free-form user input from popup"
+hidden = true
+
+[actions.remote]
+prompt = "You are a helpful assistant. Respond to the user's query clearly and concisely."
+
+[actions.local]
+prompt = "You are a helpful assistant. Answer the query concisely."
+
+# ----------------------------------------------------------------------------
+# VL-OCR - Extract text from clipboard image
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "vl_ocr"
+label = "Image OCR"
+description = "Extract text from clipboard image using vision model"
+
+[actions.remote]
+model = "qwen-vl-ocr-latest"
+is_vision = true
+min_pixels = 3072        # 32*32*3
+max_pixels = 8388608     # 32*32*8192
+# No prompt needed - vision OCR model extracts text directly
+
+[actions.local]
+prompt = "Extract text from this image."
+
+# ----------------------------------------------------------------------------
+# Write - Polish text for accuracy and professionalism
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "write"
+label = "Write"
+description = "Polish text for accuracy and professionalism"
+
+[actions.remote]
+prompt = """Polish the text in its original language for greater accuracy and professionalism and provide further considerations briefly. Output ONLY your answer NO explanation."""
+
+[actions.local]
+prompt = """Polish the text in its original language for greater accuracy and professionalism and provide further considerations briefly. Output ONLY your answer NO explanation."""
+
+# ----------------------------------------------------------------------------
+# JSON - Structure text into JSONL format
+# ----------------------------------------------------------------------------
+[[actions]]
+id = "json"
+label = "JSON"
+description = "Structure text into JSONL format"
+
+[actions.remote]
+prompt = """Structure the following text into JSONL."""
+
+[actions.local]
+prompt = """Structure the following text into JSONL."""
+
+# ============================================================================
+# ADDING CUSTOM ACTIONS
+# ============================================================================
+# Copy this template and customize:
+#
+# [[actions]]
+# id = "my_action"              # Required: unique lowercase identifier
+# label = "My Action"           # Optional: display name (defaults to id)
+# description = "What it does"  # Optional: tooltip text
+# hidden = false                # Optional: hide from hotkey dropdown
+#
+# [actions.remote]
+# model = "qwen-max"            # Optional: override default model
+# prompt = "Your prompt here"   # Required for most actions
+# temperature = 0.1             # Optional: 0.0 = deterministic
+# is_translation = false        # Set true for translation API
+# is_vision = false             # Set true for vision/OCR models
+# source_lang = "auto"          # For translation
+# target_lang = "English"       # For translation
+# min_pixels = 3072             # For vision models
+# max_pixels = 8388608          # For vision models
+# any_extra_field = "value"     # Extra fields passed to API
+#
+# [actions.local]
+# model = "Qwen3-4B-Hybrid"     # Optional: override local model
+# prompt = "Shorter prompt"     # Local models often need simpler prompts
+#
+# Then bind to a hotkey in config/hotkeys.toml:
+#   [[bindings]]
+#   key = "KeyM"
+#   action = "my_action"
+#   modifiers = "Ctrl"
