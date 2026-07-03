@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use std::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use log::{info, warn, error, debug};
@@ -154,8 +154,9 @@ struct ChatChunkDelta {
 /// ```
 pub struct LlmClient {
     client: tokio::sync::OnceCell<Client>,
-    config: ActionsConfig,
+    config: Arc<RwLock<ActionsConfig>>,
     remote_available: Arc<AtomicBool>,
+    force_local: Arc<AtomicBool>,
     ui_tx: Option<flume::Sender<crate::ui::UiEvent>>,
     cancel_flag: Option<Arc<AtomicBool>>,
     /// egui context for triggering UI repaints when streaming
@@ -163,15 +164,23 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    pub fn new(config: ActionsConfig) -> Self {
+    pub fn new(config: Arc<RwLock<ActionsConfig>>) -> Self {
         Self { 
             client: tokio::sync::OnceCell::new(), 
             config,
             remote_available: Arc::new(AtomicBool::new(true)),
+            force_local: Arc::new(AtomicBool::new(false)),
             ui_tx: None,
             cancel_flag: None,
             egui_ctx: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn config_snapshot(&self) -> ActionsConfig {
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_else(|_| ActionsConfig::default())
     }
     
     pub fn set_ui_tx(&mut self, tx: flume::Sender<crate::ui::UiEvent>) {
@@ -187,6 +196,16 @@ impl LlmClient {
         self.cancel_flag = Some(flag);
     }
     
+    /// Set force local mode (user-controlled toggle)
+    pub fn set_force_local(&self, force: bool) {
+        self.force_local.store(force, Ordering::Relaxed);
+    }
+    
+    /// Get current force local mode state
+    pub fn is_force_local(&self) -> bool {
+        self.force_local.load(Ordering::Relaxed)
+    }
+    
     /// Check if cancellation was requested
     fn is_cancelled(&self) -> bool {
         self.cancel_flag.as_ref().map_or(false, |f| f.load(Ordering::Relaxed))
@@ -194,7 +213,7 @@ impl LlmClient {
     
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
-            let timeout = self.config.defaults.timeout_ms.unwrap_or(60000) / 1000;
+            let timeout = self.config_snapshot().defaults.timeout_ms.unwrap_or(60000) / 1000;
             Client::builder()
                 .timeout(Duration::from_secs(timeout))
                 .tcp_nodelay(true)
@@ -206,8 +225,8 @@ impl LlmClient {
     }
     
     // Get action definition by ID
-    fn get_action(&self, action_id: &str) -> Option<&ActionDefinition> {
-        self.config.get_action(action_id)
+    fn get_action(&self, action_id: &str) -> Option<ActionDefinition> {
+        self.config_snapshot().get_action(action_id).cloned()
     }
     
     /// Get the display label for an action
@@ -218,7 +237,7 @@ impl LlmClient {
     /// Check if an action is a vision action
     pub fn is_vision_action(&self, action_id: &str) -> bool {
         self.get_action(action_id)
-            .and_then(|a| a.remote.as_ref())
+            .and_then(|a| a.remote)
             .map(|r| r.is_vision)
             .unwrap_or(false)
     }
@@ -234,9 +253,9 @@ impl LlmClient {
 
     /// Resolves endpoint, model, api_key, prompt, temperature, translation options, and extra params for an action.
     /// Returns: (url, model, api_key_opt, prompt_opt, temperature, translation_options, extra)
-    fn resolve_action_config(&self, action: &ActionDefinition, force_local: bool) -> Result<(String, String, Option<String>, Option<String>, f32, Option<HashMap<String, String>>, HashMap<String, serde_json::Value>)> {
-        let defaults = &self.config.defaults;
-        let use_local = force_local || self.config.force_local || !self.remote_available.load(Ordering::Relaxed);
+    fn resolve_action_config(&self, config: &ActionsConfig, action: &ActionDefinition, force_local: bool) -> Result<(String, String, Option<String>, Option<String>, f32, Option<HashMap<String, String>>, HashMap<String, serde_json::Value>)> {
+        let defaults = &config.defaults;
+        let use_local = force_local || config.force_local || self.force_local.load(Ordering::Relaxed) || !self.remote_available.load(Ordering::Relaxed);
 
         if use_local {
             // Local config: merge action.local with defaults.local
@@ -307,20 +326,10 @@ impl LlmClient {
 
     // Spawn health check MUST be called inside a runtime
     pub fn spawn_health_check(self: &Arc<Self>) {
-        // Use the first action or defaults as the canary for health checking
-        let defaults = &self.config.defaults;
-        let url = defaults.api_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let url = if url.ends_with("chat/completions") { url } else { format!("{}/chat/completions", url.trim_end_matches('/')) };
-        let api_key = defaults.api_key.clone().map(|k| Self::expand_env(&k)).unwrap_or_default();
-        
+        let llm_client = self.clone();
         let remote_available = self.remote_available.clone();
-
-        // Get the shared client (initializing if needed) before spawning loop?
-        // Actually, we want a separate client for health checks with short timeout.
         
         tokio::spawn(async move {
-            // Because we are inside spawn, we are in runtime. 
-            // We create a FRESH client dedicated for health checks to avoid polluting the main pool and with simpler timeout.
             let check_client = Client::builder()
                 .timeout(Duration::from_secs(15))
                 .tcp_nodelay(true)
@@ -330,6 +339,12 @@ impl LlmClient {
             loop {
                 // Initial delay
                 tokio::time::sleep(Duration::from_secs(60)).await;
+
+                let config = llm_client.config_snapshot();
+                let defaults = &config.defaults;
+                let url = defaults.api_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+                let url = if url.ends_with("chat/completions") { url } else { format!("{}/chat/completions", url.trim_end_matches('/')) };
+                let api_key = defaults.api_key.clone().map(|k| Self::expand_env(&k)).unwrap_or_default();
 
                 // Use GET instead of HEAD for better compatibility. 
                 // We accept any response that indicates the server received the request (even 4xx/5xx).
@@ -362,32 +377,37 @@ impl LlmClient {
 
     /// Execute an action by ID with remote/local fallback
     pub async fn execute_action(&self, action_id: &str, text: &str) -> Result<String> {
-        let action = self.get_action(action_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_id))?
-            .clone();
+        let config = self.config_snapshot();
+        let action = config.get_action(action_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_id))?;
+        let local_mode = config.force_local
+            || self.force_local.load(Ordering::Relaxed)
+            || !self.remote_available.load(Ordering::Relaxed);
         
-        // Try remote first
-        match self.resolve_action_config(&action, false) {
-            Ok((url, model, api_key, prompt, temperature, translation_options, extra)) => {
-                match self.execute_request(&url, &model, api_key, prompt.as_deref(), text, temperature, translation_options.clone(), extra.clone()).await {
-                    Ok(res) => return Ok(res),
-                    Err(e) => {
-                        if is_network_error(&e) {
-                            warn!("Remote API failed for {}, falling back to local: {}", action_id, e);
-                            self.remote_available.store(false, Ordering::Relaxed);
-                        } else {
-                            return Err(e);
+        if !local_mode {
+            match self.resolve_action_config(&config, &action, false) {
+                Ok((url, model, api_key, prompt, temperature, translation_options, extra)) => {
+                    match self.execute_request(&url, &model, api_key, prompt.as_deref(), text, temperature, translation_options, extra).await {
+                        Ok(res) => return Ok(res),
+                        Err(e) => {
+                            if is_network_error(&e) {
+                                warn!("Remote API failed for {}, falling back to local: {}", action_id, e);
+                                self.remote_available.store(false, Ordering::Relaxed);
+                            } else {
+                                return Err(e);
+                            }
                         }
                     }
+                },
+                Err(e) => {
+                    warn!("No remote config for {}: {}", action_id, e);
                 }
-            },
-            Err(e) => {
-                warn!("No remote config for {}: {}", action_id, e);
             }
-        };
+        }
         
         // Try local fallback
-        let (url, model, api_key, prompt, temperature, translation_options, extra) = self.resolve_action_config(&action, true)?;
+        let (url, model, api_key, prompt, temperature, translation_options, extra) = self.resolve_action_config(&config, &action, true)?;
         self.execute_request(&url, &model, api_key, prompt.as_deref(), text, temperature, translation_options, extra).await
     }
 
@@ -426,12 +446,13 @@ impl LlmClient {
     /// # Returns
     /// Extracted text from the image
     pub async fn execute_vision_action(&self, action_id: &str, image_base64: &str) -> Result<String> {
-        let action = self.get_action(action_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_id))?
-            .clone();
+        let config = self.config_snapshot();
+        let action = config.get_action(action_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_id))?;
         
         // Get config
-        let (url, model, api_key, prompt, temperature, _, extra) = self.resolve_action_config(&action, false)?;
+        let (url, model, api_key, prompt, temperature, _, extra) = self.resolve_action_config(&config, &action, false)?;
         
         // Get vision-specific params
         let remote = action.remote.as_ref();

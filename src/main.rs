@@ -17,12 +17,15 @@ use IntelliBoard::ui::{MyApp, UiEvent, TrayHandler};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use std::io::{Read, Write};
 use tokio::sync::mpsc;
 use log::{info, error, debug};
 use flexi_logger::{Logger, FileSpec, Criterion, Naming, Cleanup};
 use clap::Parser;
 use single_instance::SingleInstance;
 use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem, CheckMenuItem, PredefinedMenuItem}};
+
+const CONTROL_ADDR: &str = "127.0.0.1:18432";
 
 #[derive(Parser, Debug)]
 #[command(name = "IntelliBoard")]
@@ -37,8 +40,51 @@ struct Opt {
     log: bool,
 }
 
+fn send_stop_command() -> anyhow::Result<()> {
+    match std::net::TcpStream::connect(CONTROL_ADDR) {
+        Ok(mut stream) => {
+            stream.write_all(b"stop\n")?;
+            println!("Stop command sent to IntelliBoard.");
+        }
+        Err(e) => {
+            println!("No running IntelliBoard control server found at {}: {}", CONTROL_ADDR, e);
+        }
+    }
+    Ok(())
+}
+
+fn start_control_server(ui_tx: flume::Sender<UiEvent>) {
+    std::thread::spawn(move || {
+        let listener = match std::net::TcpListener::bind(CONTROL_ADDR) {
+            Ok(listener) => listener,
+            Err(e) => {
+                log::error!("Failed to bind control server at {}: {}", CONTROL_ADDR, e);
+                return;
+            }
+        };
+
+        info!("Control server listening on {}", CONTROL_ADDR);
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+
+            let mut command = String::new();
+            if stream.read_to_string(&mut command).is_ok() && command.trim().eq_ignore_ascii_case("stop") {
+                info!("Stop command received");
+                let _ = ui_tx.send(UiEvent::Quit);
+                break;
+            }
+        }
+    });
+}
+
 fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
+
+    if opt.stop {
+        return send_stop_command();
+    }
 
     let instance = SingleInstance::new("IntelliBoard_app").map_err(|e| anyhow::anyhow!("Failed to check single instance: {}", e))?;
     if !instance.is_single() {
@@ -113,6 +159,7 @@ fn main() -> anyhow::Result<()> {
     let (ui_tx, ui_rx) = flume::unbounded::<UiEvent>();
     let (tx, mut rx) = mpsc::channel::<AppEvent>(100);
     let (graph_tx, graph_rx) = mpsc::channel::<MemoryEvent>(256);
+    start_control_server(ui_tx.clone());
     
     // Config watcher for hot-reload
     let config_watcher = match ConfigWatcher::new("config") {
@@ -136,6 +183,11 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Enable dark mode for native Win32 context menus (tray right-click, etc.)
+    // Must be called before TrayIconBuilder::build() to take effect.
+    #[cfg(windows)]
+    IntelliBoard::platform::enable_dark_mode();
+
     // Setup Tray
     let tray_menu = Menu::new();
     let show_log_i = MenuItem::new("Show Log", true, None);
@@ -144,6 +196,8 @@ fn main() -> anyhow::Result<()> {
     let hotkey_config_id = hotkey_config_i.id().clone();
     let enable_i = CheckMenuItem::new("Enable Processing", true, true, None);
     let enable_id = enable_i.id().clone();
+    let local_mode_i = CheckMenuItem::new("Use Local Model", true, false, None);
+    let local_mode_id = local_mode_i.id().clone();
     let exit_i = MenuItem::new("Exit", true, None);
     let exit_id = exit_i.id().clone();
 
@@ -165,6 +219,7 @@ fn main() -> anyhow::Result<()> {
     tray_menu.append(&show_log_i).unwrap();
     tray_menu.append(&hotkey_config_i).unwrap();
     tray_menu.append(&enable_i).unwrap();
+    tray_menu.append(&local_mode_i).unwrap();
     tray_menu.append(&exit_i).unwrap();
 
     let tray_icon = TrayIconBuilder::new()
@@ -178,6 +233,8 @@ fn main() -> anyhow::Result<()> {
         icon: tray_icon,
         enable_item: enable_i,
         enable_id,
+        local_mode_item: local_mode_i,
+        local_mode_id,
         show_log_id,
         hotkey_config_id,
         exit_id,
@@ -196,15 +253,7 @@ fn main() -> anyhow::Result<()> {
     // Process Manager for child windows
     let process_manager = Arc::new(ProcessManager::new());
     
-    // Use Mutex to allow mutation of LlmClient if we weren't using Arc. 
-    // Since we are using Arc, we can't easily mutate.
-    // However, we want to inject UI TX into LLM client for streaming.
-    // Let's modify LlmClient to be capable of receiving the UI TX.
-    
-    // We need to pass the tx to the client. But the tx is created here.
-    // We'll wrap LlmClient in Arc<Mutex<>> or just configure it before wrapping in Arc if possible.
-    // Actually, simpler: construct client with ui_tx option.
-    let mut raw_llm_client = LlmClient::new(actions_config.clone());
+    let mut raw_llm_client = LlmClient::new(shared_actions.clone());
     // Use flume channel - works in both sync and async contexts
     raw_llm_client.set_ui_tx(ui_tx.clone());
     
@@ -250,12 +299,38 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // Selection-detection mouse hook: fires AppEvent::SelectionAt when the user
+    // finishes a drag selection. The toolbar pops up at that point. Disabled by
+    // the IntelliBoard_NO_SELECTION_HOOK env var for users who prefer hotkeys only.
+    let _selection_hook = if std::env::var_os("IntelliBoard_NO_SELECTION_HOOK").is_none() {
+        match IntelliBoard::platform::init_selection_mouse_hook(tx.clone()) {
+            Ok(h) => {
+                info!("Selection-detection mouse hook installed");
+                Some(h)
+            }
+            Err(e) => {
+                log::warn!("Failed to install selection mouse hook: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("Selection-detection hook disabled by IntelliBoard_NO_SELECTION_HOOK");
+        None
+    };
+
+    // Guard set while we synthesize a Ctrl+C to grab the active selection, so
+    // the clipboard listener knows to ignore the resulting clipboard write
+    // (it is a programmatic side-effect, not a user copy).
+    let injecting_copy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     
     // Clone shared configs for async block
     let shared_actions_inner = shared_actions.clone();
     let shared_hotkeys_inner = shared_hotkeys.clone();
     let hotkey_system_inner = hotkey_system.clone();
     let cancel_flag_inner = cancel_flag.clone();
+    let injecting_copy_inner = injecting_copy.clone();
+    let ui_tx_inner = ui_tx.clone();
 
     // Main Tokio Loop
     std::thread::spawn(move || {
@@ -265,7 +340,9 @@ fn main() -> anyhow::Result<()> {
             llm_client.spawn_health_check();
 
             // IPC Server for Graph UI (create first to get notifier)
-            let ipc_server = GraphIpcServer::new(memory_store.clone(), 12345);
+            // Attach the LLM client so Auto Connect can call the AI model.
+            let ipc_server = GraphIpcServer::new(memory_store.clone(), 12345)
+                .with_llm_client(llm_client.clone());
             let graph_notifier = ipc_server.get_notifier();
             
             // Graph server task (receives MemoryEvent messages and updates MemoryStore)
@@ -285,6 +362,16 @@ fn main() -> anyhow::Result<()> {
                         // before any other processing or filtering
                         if let Ok(mut guard) = last_copy_time.lock() {
                             *guard = std::time::Instant::now();
+                        }
+                        
+                        // If we synthesized the copy ourselves (to grab a selection),
+                        // skip memory storage and the toolbar trigger — the SelectionAt
+                        // handler already takes care of showing the toolbar.
+                        if injecting_copy_inner.load(std::sync::atomic::Ordering::Relaxed) {
+                            if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
+                                log::debug!("[diag] skipping injected copy");
+                            }
+                            continue;
                         }
                         
                         // Store clipboard content to memory (skip programmatic writes)
@@ -361,6 +448,66 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 });
                             },
+                            AppEvent::SetClipboard(text) => {
+                                // Toolbar wants the clipboard to hold the selected text
+                                // before the action runs. Mark it programmatic so it
+                                // doesn't get re-stored into memory, then let the
+                                // TriggerAction that follows pick it up.
+                                if let Err(e) = clipboard.set_text_programmatic(&text) {
+                                    error!("SetClipboard failed: {}", e);
+                                }
+                            },
+                            AppEvent::SelectionAt { x, y } => {
+                                // The user just finished dragging a selection. We grab the
+                                // selected text by synthesizing a Ctrl+C in the focused
+                                // window, then pop the toolbar near the release point.
+                                // Run on a background task so the event loop stays responsive.
+                                let cb = clipboard.clone();
+                                let injecting = injecting_copy_inner.clone();
+                                let ui_tx2 = ui_tx_inner.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    // Remember what was on the clipboard so we can restore it.
+                                    let backup = cb.get_text().ok();
+
+                                    // Signal the clipboard listener to ignore the next write(s).
+                                    injecting.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                                    IntelliBoard::platform::send_copy_shortcut();
+                                    // Give the target app time to push the selection to the
+                                    // clipboard. 120ms is empirically safe for Office/browsers.
+                                    std::thread::sleep(std::time::Duration::from_millis(120));
+
+                                    let selected = cb.get_text().ok();
+                                    injecting.store(false, std::sync::atomic::Ordering::SeqCst);
+
+                                    // Decide whether to show the toolbar.
+                                    let meaningful = match selected.as_deref() {
+                                        Some(t) => {
+                                            let trimmed = t.trim();
+                                            trimmed.len() >= 1
+                                                && !trimmed.chars().all(|c| c.is_whitespace())
+                                        }
+                                        None => false,
+                                    };
+
+                                    if meaningful {
+                                        if let Some(t) = selected {
+                                            let _ = ui_tx2.send(UiEvent::ShowActionToolbar {
+                                                text: t,
+                                                x,
+                                                y,
+                                            });
+                                        }
+                                    }
+
+                                    // Best-effort restore of the previous clipboard so our
+                                    // selection-grab doesn't clobber the user's clipboard.
+                                    if let Some(prev) = backup {
+                                        // Mark programmatic so it doesn't get recorded again.
+                                        let _ = cb.set_text_programmatic(&prev);
+                                    }
+                                });
+                            },
                              AppEvent::Cancel => {
                                 info!("Cancel requested - stopping in-flight request");
                                 cancel_flag_inner.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -368,6 +515,10 @@ fn main() -> anyhow::Result<()> {
                             AppEvent::ToggleProcessing(enabled) => {
                                 // processor.set_enabled(enabled); // We removed processor
                                 info!("Processing enabled: {}", enabled);
+                            },
+                            AppEvent::ToggleLocalMode(use_local) => {
+                                info!("Local mode toggled: {}", use_local);
+                                llm_client.set_force_local(use_local);
                             },
                             AppEvent::ShowMemoryGraph => {
                                 let _ = ui_tx_for_events.send(UiEvent::ShowMemoryGraph);
@@ -443,7 +594,7 @@ fn main() -> anyhow::Result<()> {
         "IntelliBoard",
         options,
         Box::new(move |cc| {
-            let app = MyApp::new(cc, ui_rx, tx.clone(), gui_ctx, tray_handler, process_manager);
+            let app = MyApp::new(cc, ui_rx, tx.clone(), gui_ctx, tray_handler, process_manager, shared_actions.clone());
             Box::new(app)
         }),
     );

@@ -22,8 +22,13 @@ use winapi::um::winuser::{
     PostThreadMessageW, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN, WM_QUIT,
     KBDLLHOOKSTRUCT, MSG, GetAsyncKeyState, VK_CONTROL, VK_SHIFT, VK_MENU,
     VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
+    GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, GetGUIThreadInfo,
+    GUITHREADINFO,
+    WH_MOUSE_LL, WM_LBUTTONUP, WM_LBUTTONDOWN, MSLLHOOKSTRUCT,
+    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
 };
 use winapi::um::libloaderapi::GetModuleHandleW;
+use winapi::um::libloaderapi::{LoadLibraryW, GetProcAddress};
 
 thread_local! {
     static HOOK_STATE: RefCell<Option<HookCallbackState>> = RefCell::new(None);
@@ -403,6 +408,168 @@ pub fn is_ime_composing() -> bool {
     false
 }
 
+/// Get the position (in physical screen pixels) where a selection popup should
+/// appear. Prefers the active caret (text selection in the focused window);
+/// falls back to the mouse cursor.
+///
+/// Returns `(x, y)` where `y` is positioned just below the caret/cursor so the
+/// popup opens underneath the selection. On any failure the mouse cursor is
+/// used, and on total failure a sensible default near the screen center is
+/// returned.
+pub fn get_selection_popup_pos() -> (i32, i32) {
+    // 1. Try to get the caret of the focused window (works for many Win32 edit
+    //    controls and Chromium/Electron apps that expose the caret via
+    //    GetGUIThreadInfo). Returns client coordinates — convert to screen.
+    if let Some((x, y)) = get_caret_screen_pos() {
+        return (x, y + 18); // 18px below caret baseline
+    }
+
+    // 2. Fall back to mouse cursor
+    if let Some((x, y)) = get_mouse_pos() {
+        return (x + 12, y + 14); // small offset so the popup doesn't open under the click
+    }
+
+    // 3. Total fallback — primary monitor center
+    (300, 300)
+}
+
+/// Returns the caret position in screen coordinates if available.
+fn get_caret_screen_pos() -> Option<(i32, i32)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+
+        let mut pid: u32 = 0;
+        let tid = GetWindowThreadProcessId(hwnd, &mut pid);
+        if tid == 0 {
+            return None;
+        }
+
+        let mut info: GUITHREADINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(tid, &mut info) == 0 {
+            return None;
+        }
+
+        // rcCaret is in client coords of hwnd — convert to screen
+        let caret = info.rcCaret;
+        let cx = caret.left;
+        let cy = caret.bottom; // below the selection
+
+        if cx == 0 && cy == 0 {
+            return None;
+        }
+
+        // ClientToScreen
+        let mut pt = winapi::shared::windef::POINT { x: cx, y: cy };
+        if winapi::um::winuser::ClientToScreen(hwnd, &mut pt) == 0 {
+            return None;
+        }
+        Some((pt.x, pt.y))
+    }
+}
+
+/// Returns the current mouse cursor position in screen coordinates.
+fn get_mouse_pos() -> Option<(i32, i32)> {
+    unsafe {
+        let mut pt: winapi::shared::windef::POINT = std::mem::zeroed();
+        if GetCursorPos(&mut pt) == 0 {
+            return None;
+        }
+        Some((pt.x, pt.y))
+    }
+}
+
+/// Public accessor for the global mouse cursor position in physical screen
+/// pixels. Returns `None` if the OS call fails.
+pub fn get_cursor_pos() -> Option<(i32, i32)> {
+    get_mouse_pos()
+}
+
+/// Primary monitor dimensions in physical screen pixels.
+/// Matches the coordinate space of `get_cursor_pos()` and `MSLLHOOKSTRUCT.pt`
+/// — both use physical pixels, making screen-edge clamping consistent even on
+/// high-DPI / scaled displays.
+pub fn get_primary_monitor_size() -> (i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_CXSCREEN) as i32,
+            GetSystemMetrics(SM_CYSCREEN) as i32,
+        )
+    }
+}
+
+/// Synthesize a Ctrl+C keystroke via SendInput so the currently focused
+/// application copies its active text selection to the clipboard. This is the
+/// only reliable cross-application way to read a selection that the user made
+/// in another process.
+///
+/// The caller is responsible for:
+///   1. Backing up the current clipboard (so it can be restored afterwards).
+///   2. Sleeping briefly so the target app has time to write the selection.
+///   3. Reading the clipboard and restoring the backup.
+pub fn send_copy_shortcut() {
+    // VK_CONTROL=0x11, 'C'=0x43
+    press_key_combo(0x11, 0x43);
+}
+
+/// Press two virtual keys (modifier first, then key), then release in reverse
+/// order, using SendInput with KEYBDINPUT. A small sleep between events helps
+/// flaky apps register the chord as a copy rather than a stray "c".
+fn press_key_combo(modifier_vk: u16, key_vk: u16) {
+    use winapi::um::winuser::{
+        SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    };
+
+    unsafe {
+        let mut inputs: [INPUT; 4] = std::mem::zeroed();
+
+        // modifier down
+        inputs[0].type_ = INPUT_KEYBOARD;
+        *(inputs[0].u.ki_mut()) = KEYBDINPUT {
+            wVk: modifier_vk,
+            wScan: 0,
+            dwFlags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        // key down
+        inputs[1].type_ = INPUT_KEYBOARD;
+        *(inputs[1].u.ki_mut()) = KEYBDINPUT {
+            wVk: key_vk,
+            wScan: 0,
+            dwFlags: 0,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        // key up
+        inputs[2].type_ = INPUT_KEYBOARD;
+        *(inputs[2].u.ki_mut()) = KEYBDINPUT {
+            wVk: key_vk,
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        // modifier up
+        inputs[3].type_ = INPUT_KEYBOARD;
+        *(inputs[3].u.ki_mut()) = KEYBDINPUT {
+            wVk: modifier_vk,
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+
+        // Brief pauses help some apps (Office, browsers) register the chord.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _ = SendInput(4, inputs.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Focus a window by its title (for single-instance child windows)
 pub fn focus_window_by_title(title: &str) -> bool {
     let title_wide: Vec<u16> = OsStr::new(title)
@@ -438,4 +605,265 @@ pub fn init_hotkey_system(
     let hook = Arc::new(LowLevelKeyboardHook::new(tx, shared_hotkeys, last_copy_time));
     hook.install()?;
     Ok(hook)
+}
+
+// ---------------------------------------------------------------------------
+// Selection-detection mouse hook
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static SEL_HOOK_TX: RefCell<Option<mpsc::Sender<AppEvent>>> = RefCell::new(None);
+}
+
+/// Minimum mouse travel (in pixels) between button-down and button-up for the
+/// release to count as a "selection ended" gesture. Prevents firing on plain
+/// clicks that did not drag-select anything.
+const SEL_MIN_TRAVEL_PX: i32 = 6;
+
+/// A low-level mouse hook that watches for the end of a drag selection (left
+/// button released after the cursor moved a few pixels) and emits
+/// `AppEvent::SelectionAt { x, y }` so the UI can pop up the action toolbar
+/// right where the user finished selecting.
+///
+/// The hook is non-consuming — it always calls `CallNextHookEx`, so the target
+/// application behaves normally. Selection text is NOT read here (that requires
+/// a synthesized Ctrl+C); the main loop does that on receiving the event.
+pub struct SelectionMouseHook {
+    tx: mpsc::Sender<AppEvent>,
+    hook_handle: Arc<parking_lot::Mutex<Option<usize>>>,
+    thread_id: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+    thread_handle: Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+impl SelectionMouseHook {
+    pub fn new(tx: mpsc::Sender<AppEvent>) -> Self {
+        Self {
+            tx,
+            hook_handle: Arc::new(parking_lot::Mutex::new(None)),
+            thread_id: Arc::new(AtomicU32::new(0)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            thread_handle: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    pub fn install(&self) -> Result<(), String> {
+        self.stop_flag.store(false, Ordering::SeqCst);
+
+        let tx = self.tx.clone();
+        let hook_handle = self.hook_handle.clone();
+        let thread_id_storage = self.thread_id.clone();
+        let stop_flag = self.stop_flag.clone();
+        let thread_handle_storage = self.thread_handle.clone();
+
+        info!("Installing selection-detection mouse hook (WH_MOUSE_LL)");
+
+        let handle = std::thread::spawn(move || {
+            let current_thread_id =
+                unsafe { winapi::um::processthreadsapi::GetCurrentThreadId() };
+            thread_id_storage.store(current_thread_id, Ordering::SeqCst);
+
+            SEL_HOOK_TX.with(|cell| {
+                *cell.borrow_mut() = Some(tx.clone());
+            });
+
+            // Reset the drag-origin thread-local so the first selection after a
+            // restart does not see a stale button-down position.
+            DOWN_POS.with(|c| *c.borrow_mut() = None);
+
+            let hook = unsafe {
+                SetWindowsHookExW(
+                    WH_MOUSE_LL,
+                    Some(low_level_mouse_proc),
+                    GetModuleHandleW(std::ptr::null()),
+                    0,
+                )
+            };
+            if hook.is_null() {
+                error!("SetWindowsHookExW(WH_MOUSE_LL) failed");
+                return;
+            }
+            info!("Selection-detection mouse hook installed");
+            {
+                let mut guard = hook_handle.lock();
+                *guard = Some(hook as usize);
+            }
+
+            unsafe {
+                let mut msg: MSG = std::mem::zeroed();
+                while !stop_flag.load(Ordering::Relaxed) {
+                    let result = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                    if result <= 0 {
+                        break;
+                    }
+                }
+                UnhookWindowsHookEx(hook);
+                info!("Selection-detection mouse hook uninstalled");
+            }
+
+            SEL_HOOK_TX.with(|cell| {
+                *cell.borrow_mut() = None;
+            });
+        });
+
+        {
+            let mut guard = thread_handle_storage.lock();
+            *guard = Some(handle);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        Ok(())
+    }
+
+    pub fn uninstall(&self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        let thread_id = self.thread_id.load(Ordering::SeqCst);
+        if thread_id != 0 {
+            unsafe {
+                PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+            }
+        }
+        if let Some(handle) = self.thread_handle.lock().take() {
+            let _ = handle.join();
+        }
+        {
+            let mut guard = self.hook_handle.lock();
+            *guard = None;
+        }
+    }
+}
+
+impl Drop for SelectionMouseHook {
+    fn drop(&mut self) {
+        self.uninstall();
+    }
+}
+
+thread_local! {
+    static DOWN_POS: std::cell::RefCell<Option<(i32, i32)>> = std::cell::RefCell::new(None);
+}
+
+/// Low-level mouse callback. Runs on the hook's own thread (the one that
+/// installed it), so reading the `DOWN_POS` / `SEL_HOOK_TX` thread-locals is
+/// safe.
+///
+/// IMPORTANT: must be fast (< 300ms) or Windows silently unhooks it.
+unsafe extern "system" fn low_level_mouse_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code < 0 {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
+    if wparam as u32 == WM_LBUTTONDOWN {
+        let m = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        DOWN_POS.with(|c| {
+            *c.borrow_mut() = Some((m.pt.x, m.pt.y));
+        });
+    } else if wparam as u32 == WM_LBUTTONUP {
+        let m = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        let up = (m.pt.x, m.pt.y);
+        let was_drag = DOWN_POS.with(|c| {
+            c.borrow_mut()
+                .take()
+                .map(|d| (d.0 - up.0).abs() >= SEL_MIN_TRAVEL_PX || (d.1 - up.1).abs() >= SEL_MIN_TRAVEL_PX)
+                .unwrap_or(false)
+        });
+
+        if was_drag {
+            SEL_HOOK_TX.with(|cell| {
+                if let Some(tx) = cell.borrow().as_ref() {
+                    let _ = tx.try_send(AppEvent::SelectionAt { x: up.0, y: up.1 });
+                }
+            });
+        }
+    }
+
+    // Always pass through — we never consume mouse events.
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+/// Install the selection-detection mouse hook. Returns nothing useful — the
+/// returned `Arc` just keeps the hook alive. Drop it to uninstall.
+pub fn init_selection_mouse_hook(tx: mpsc::Sender<AppEvent>) -> Result<Arc<SelectionMouseHook>, String> {
+    let hook = Arc::new(SelectionMouseHook::new(tx));
+    hook.install()?;
+    Ok(hook)
+}
+
+// ---------------------------------------------------------------------------
+// Windows dark-mode support for native context menus (tray right-click, etc.)
+// ---------------------------------------------------------------------------
+
+/// Enable dark mode for Win32 context menus (tray, popup menus).
+///
+/// Calls `SetPreferredAppMode(ForceDark)` + `FlushMenuThemes()` from
+/// `uxtheme.dll` (available since Windows 10 1809). Falls back silently on
+/// older Windows versions where the entry point is missing.
+///
+/// Must be called **before** any native menus are created — ideally at the
+/// very top of `main()`, ahead of `TrayIconBuilder::build()`.
+pub fn enable_dark_mode() {
+    let dll_name: Vec<u16> = std::ffi::OsStr::new("uxtheme.dll\0")
+        .encode_wide()
+        .collect();
+
+    unsafe {
+        let handle = LoadLibraryW(dll_name.as_ptr());
+        if handle.is_null() {
+            warn!("enable_dark_mode: uxtheme.dll failed to load");
+            return;
+        }
+        info!("enable_dark_mode: uxtheme.dll loaded");
+
+        // These three are ORDINAL-ONLY exports in uxtheme.dll —
+        // GetProcAddress by name returns NULL, so we look them up by ordinal.
+        //   SetPreferredAppMode             = ordinal 135
+        //   FlushMenuThemes                 = ordinal 136
+        //   RefreshImmersiveColorPolicyState = ordinal 145
+        type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+        type NoArgs = unsafe extern "system" fn();
+
+        let set_preferred = get_proc_by_ordinal::<SetPreferredAppMode>(handle, 135);
+        let flush = get_proc_by_ordinal::<NoArgs>(handle, 136);
+        let refresh = get_proc_by_ordinal::<NoArgs>(handle, 145);
+
+        if let Some(f) = set_preferred {
+            // PreferredAppMode::ForceDark = 2
+            let prev = f(2);
+            info!("SetPreferredAppMode(ForceDark) called, prev_mode={}", prev);
+        } else {
+            warn!("enable_dark_mode: SetPreferredAppMode (ord 135) not found");
+        }
+        if let Some(f) = refresh {
+            f();
+            info!("RefreshImmersiveColorPolicyState called");
+        } else {
+            warn!("enable_dark_mode: RefreshImmersiveColorPolicyState (ord 145) not found");
+        }
+        if let Some(f) = flush {
+            f();
+            info!("FlushMenuThemes called");
+        } else {
+            warn!("enable_dark_mode: FlushMenuThemes (ord 136) not found");
+        }
+    }
+}
+
+/// Resolve an ordinal export from a loaded library.
+///
+/// `ordinal` MUST be <= 0xFFFF; passing it as the low word of the LPCSTR
+/// (high word zero) is the documented Win32 convention for ordinal lookup.
+unsafe fn get_proc_by_ordinal<T>(
+    handle: winapi::shared::minwindef::HINSTANCE,
+    ordinal: u16,
+) -> Option<T> {
+    let ptr = GetProcAddress(handle, ordinal as winapi::shared::ntdef::LPCSTR);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(std::mem::transmute_copy(&ptr))
+    }
 }

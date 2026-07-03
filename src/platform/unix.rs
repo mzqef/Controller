@@ -23,6 +23,37 @@ pub fn is_ime_composing() -> bool {
     false
 }
 
+/// Stub for Unix/macOS - caret/cursor position for selection popup.
+/// Returns a fixed position; full implementation would use X11/Wayland APIs.
+pub fn get_selection_popup_pos() -> (i32, i32) {
+    (300, 300)
+}
+
+/// Stub for Unix/macOS - selection-detection mouse hook.
+/// rdev::grab already captures mouse events on some platforms, but wiring the
+/// drag-selection detection here is left as a TODO. The toolbar can still be
+/// triggered via the hotkey path.
+pub fn init_selection_mouse_hook(_tx: tokio::sync::mpsc::Sender<crate::core::events::AppEvent>) -> Result<Arc<()>, String> {
+    warn!("init_selection_mouse_hook not implemented on Unix/macOS");
+    Ok(Arc::new(()))
+}
+
+/// Stub for Unix/macOS - synthesized Ctrl+C for grabbing a selection.
+/// A real implementation would use xdotool / CGEvent. No-op here.
+pub fn send_copy_shortcut() {}
+
+/// Stub for Unix/macOS - global cursor position. Returns `None`; full
+/// implementation would query X11 / Wayland.
+pub fn get_cursor_pos() -> Option<(i32, i32)> {
+    None
+}
+
+/// Stub for Unix/macOS - primary monitor size. Returns a fallback; full
+/// implementation would query X11 / Wayland.
+pub fn get_primary_monitor_size() -> (i32, i32) {
+    (1920, 1080)
+}
+
 /// Initialize platform-specific hotkey system using rdev::grab
 /// 
 /// Note: On Unix, the grab callback reads from shared_hotkeys on each event,

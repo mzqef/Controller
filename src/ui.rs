@@ -11,10 +11,31 @@ use tokio::sync::mpsc::Sender;
 use tray_icon::menu::{MenuEvent, CheckMenuItem};
 use tray_icon::TrayIconEvent;
 
+use crate::ui::theme::{
+    SPACE_2, SPACE_3, SPACE_4,
+    RADIUS_MD, RADIUS_SM,
+    TEXT_SM, TEXT_BASE, TEXT_MD,
+    STROKE_HAIRLINE,
+    SURFACE_2,
+    BORDER,
+    NEON_CYAN, NEON_PINK, DANGER_TEXT, SUCCESS, WARN, TEXT_COLOR, TEXT_MUTED,
+    CTRL_H_SM,
+};
+
+// Result window geometry (kept here for clarity; was hardcoded inline before).
+const RESULT_W: f32 = 520.0;
+const RESULT_H: f32 = 700.0;
+const RESULT_X: f32 = 1350.0;
+const RESULT_Y: f32 = 250.0;
+const BAR_W: f32 = 300.0;
+const BAR_H: f32 = 56.0;
+
 pub struct TrayHandler {
     pub icon: tray_icon::TrayIcon,
     pub enable_item: CheckMenuItem,
     pub enable_id: tray_icon::menu::MenuId,
+    pub local_mode_item: CheckMenuItem,
+    pub local_mode_id: tray_icon::menu::MenuId,
     pub exit_id: tray_icon::menu::MenuId,
     pub show_log_id: tray_icon::menu::MenuId,
     pub hotkey_config_id: tray_icon::menu::MenuId,
@@ -24,13 +45,19 @@ pub struct TrayHandler {
 
 pub enum UiEvent {
     /// Processing started with action label for display (e.g., "Translation", "Image OCR")
-    ProcessingStarted(String),
+    /// and the original input text (so the result window can show the correct input
+    /// immediately on popup, instead of stale content from the previous call).
+    ProcessingStarted(String, String),
     ShowResult(String, String), // original, result
     StreamUpdate(String), // chunk
     StreamEnd(bool), // true = success, false = incomplete
     StreamError(String), // error message
     ShowMemoryGraph,
     ShowHotkeyConfig,
+    /// Pop up the floating action toolbar near the selection. Carries the
+    /// currently-selected text and the screen position (x, y) where the
+    /// toolbar should anchor.
+    ShowActionToolbar { text: String, x: i32, y: i32 },
     Quit,
 }
 
@@ -43,6 +70,50 @@ enum AppState {
     Error,
     Incomplete,
 }
+
+/// Floating selection toolbar state — pops up near the caret/cursor when the
+/// user copies text, offering clickable AI functions as an alternative to the
+/// hotkey path.
+struct ToolbarState {
+    visible: bool,
+    text: String,
+    /// Anchor position (mouse release point) in physical screen pixels.
+    pos: (i32, i32),
+    /// Last known toolbar window rect in physical screen pixels, updated each
+    /// frame after positioning. Used for the hover-keep / leave-hide test.
+    rect: Option<egui::Rect>,
+    /// When the toolbar was first shown (for the hard timeout).
+    shown_at: Instant,
+    /// Last time the cursor was confirmed to be inside the keep-zone (toolbar
+    /// rect ∪ anchor grace area). When the cursor leaves, we hide promptly.
+    last_in_zone: Instant,
+    /// Latest snapshot of available actions (id, label) for rendering buttons.
+    actions: Vec<(String, String)>,
+}
+
+impl Default for ToolbarState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            text: String::new(),
+            pos: (300, 300),
+            rect: None,
+            shown_at: Instant::now() - std::time::Duration::from_secs(60),
+            last_in_zone: Instant::now() - std::time::Duration::from_secs(60),
+            actions: Vec::new(),
+        }
+    }
+}
+
+/// Absolute hard timeout: even if the cursor never leaves, hide after this long
+/// so the toolbar can't linger forever.
+const TOOLBAR_TIMEOUT_SECS: u64 = 12;
+/// Grace radius (px) around the anchor point that still counts as "staying".
+/// Lets the user drift the mouse a little without dismissing the popup.
+const ANCHOR_GRACE_PX: f32 = 36.0;
+/// How long the cursor may be outside the keep-zone before we hide. Small but
+/// non-zero to avoid flicker on rapid mouse jitter.
+const LEAVE_GRACE_MS: u64 = 120;
 
 pub struct MyApp {
     rx: flume::Receiver<UiEvent>,
@@ -58,6 +129,10 @@ pub struct MyApp {
     process_manager: Arc<crate::core::process_manager::ProcessManager>,
     /// Current action label for processing indicator
     current_action_label: String,
+    /// Floating action toolbar state (pops up after a copy).
+    toolbar: ToolbarState,
+    /// Shared actions config so the toolbar can render the current function list.
+    shared_actions: Arc<std::sync::RwLock<crate::core::config::ActionsConfig>>,
 }
 
 impl MyApp {
@@ -68,12 +143,25 @@ impl MyApp {
         ctx_holder: Arc<Mutex<Option<egui::Context>>>,
         tray_handler: Arc<Mutex<TrayHandler>>,
         process_manager: Arc<crate::core::process_manager::ProcessManager>,
+        shared_actions: Arc<std::sync::RwLock<crate::core::config::ActionsConfig>>,
     ) -> Self {
         info!("MyApp initialized");
         *ctx_holder.lock().unwrap() = Some(cc.egui_ctx.clone());
         
         theme::configure_fonts(&cc.egui_ctx);
         theme::apply_theme(&cc.egui_ctx);
+
+        // Build initial toolbar action list from config (visible, non-translation-text
+        // entries — translation/vision actions are still listed; user can click).
+        let actions = shared_actions
+            .read()
+            .map(|cfg| {
+                cfg.visible_actions()
+                    .iter()
+                    .map(|a| (a.id.clone(), a.label().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         Self {
             rx,
@@ -88,6 +176,8 @@ impl MyApp {
             last_type_time: Instant::now(),
             process_manager,
             current_action_label: String::new(),
+            toolbar: ToolbarState { actions, ..Default::default() },
+            shared_actions,
         }
     }
 }
@@ -115,6 +205,10 @@ impl eframe::App for MyApp {
                 let _ = handler.icon.set_icon(Some(new_icon));
 
                 let _ = handler.tx.try_send(AppEvent::ToggleProcessing(enabled));
+            } else if event.id == handler.local_mode_id {
+                let use_local = handler.local_mode_item.is_checked();
+                info!("Tray Local Mode toggled: {}", use_local);
+                let _ = handler.tx.try_send(AppEvent::ToggleLocalMode(use_local));
             } else if event.id == handler.show_log_id {
                 info!("Tray Show Log clicked");
                 let log_dir = std::path::Path::new("logs");
@@ -166,11 +260,14 @@ impl eframe::App for MyApp {
         // Check for new events
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                UiEvent::ProcessingStarted(action_label) => {
+                UiEvent::ProcessingStarted(action_label, original_input) => {
                     info!("UI received ProcessingStarted event: {}", action_label);
                     self.text.clear();
                     self.displayed_text.clear();
                     self.current_action_label = action_label;
+                    // Show the correct input immediately so the result window
+                    // does not display stale content from the previous call.
+                    self.original_text = original_input;
                     self.visible = true;
                     self.needs_resize = true;
                     self.state = AppState::Waiting;
@@ -204,8 +301,8 @@ impl eframe::App for MyApp {
                     }
                     
                     // Move window to right side, lower position
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([1350.0, 250.0].into()));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([500.0, 700.0].into()));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([RESULT_X, RESULT_Y].into()));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([RESULT_W, RESULT_H].into()));
                     if std::env::var_os("IntelliBoard_NO_UI_FOCUS").is_none() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     } else if std::env::var_os("IntelliBoard_DIAG_UI").is_some() {
@@ -226,8 +323,8 @@ impl eframe::App for MyApp {
                         self.needs_resize = true;
                         
                         // Move to result window position/size
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([1350.0, 250.0].into()));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([500.0, 700.0].into()));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([RESULT_X, RESULT_Y].into()));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([RESULT_W, RESULT_H].into()));
                     }
                     ctx.request_repaint();
                 }
@@ -245,6 +342,24 @@ impl eframe::App for MyApp {
                     self.displayed_text = self.text.clone(); // Show error immediately
                     self.state = AppState::Error;
                     self.needs_resize = true;
+                    ctx.request_repaint();
+                }
+                UiEvent::ShowActionToolbar { text, x, y } => {
+                    info!("Showing action toolbar at ({},{}), text len={}", x, y, text.len());
+                    // Refresh action list from current config in case it changed
+                    if let Ok(cfg) = self.shared_actions.read() {
+                        self.toolbar.actions = cfg
+                            .visible_actions()
+                            .iter()
+                            .map(|a| (a.id.clone(), a.label().to_string()))
+                            .collect();
+                    }
+                    self.toolbar.text = text;
+                    self.toolbar.pos = (x, y);
+                    self.toolbar.rect = None;
+                    self.toolbar.visible = true;
+                    self.toolbar.shown_at = Instant::now();
+                    self.toolbar.last_in_zone = Instant::now();
                     ctx.request_repaint();
                 }
 // use crate::core::ipc_server; // Removed misplaced import
@@ -338,16 +453,185 @@ impl eframe::App for MyApp {
              ctx.request_repaint();
         }
 
+        // ----- Floating Action Toolbar -----
+        // Pops up right where the user finished a text selection (mouse release
+        // point). Sticks to the selection/mouse: stays open while the cursor
+        // hovers the toolbar OR lingers near the anchor; hides the moment the
+        // cursor moves away.
+        if self.toolbar.visible && self.state == AppState::Idle {
+            // Read the global cursor every frame so we can react even while the
+            // egui window itself has no focus / no pointer events.
+            let cursor = crate::platform::get_cursor_pos();
+            let now = Instant::now();
+
+            // Hard timeout — never linger forever, even if hovered.
+            if now.duration_since(self.toolbar.shown_at).as_secs() >= TOOLBAR_TIMEOUT_SECS {
+                info!("Toolbar hard timeout, hiding");
+                self.toolbar.visible = false;
+            }
+
+            // Determine whether the cursor is in the keep-zone.
+            let in_zone = match (cursor, self.toolbar.rect) {
+                (Some((cx, cy)), Some(rect)) => {
+                    let in_toolbar = rect.contains(egui::pos2(cx as f32, cy as f32));
+                    // Grace circle around the anchor (the mouse-release point),
+                    // so the user can move from selection → toolbar without the
+                    // popup dismissing itself.
+                    let dx = cx as f32 - self.toolbar.pos.0 as f32;
+                    let dy = cy as f32 - self.toolbar.pos.1 as f32;
+                    let near_anchor = (dx * dx + dy * dy).sqrt() <= ANCHOR_GRACE_PX;
+                    in_toolbar || near_anchor
+                }
+                _ => true, // can't read cursor yet — assume inside (don't flicker on show)
+            };
+
+            if in_zone {
+                self.toolbar.last_in_zone = now;
+            } else if now.duration_since(self.toolbar.last_in_zone).as_millis()
+                >= LEAVE_GRACE_MS as u128
+            {
+                info!("Cursor left toolbar zone, hiding");
+                self.toolbar.visible = false;
+            }
+
+            // Keep repainting so the leave/timeout checks actually fire on time.
+            ctx.request_repaint();
+        }
+
+        if self.toolbar.visible && self.state == AppState::Idle {
+            // Compact geometry: small pill, tight padding, short labels.
+            let btn_w = 56.0;
+            let btn_h = 26.0;
+            let gap = 2.0;
+            let pad = 3.0;
+            let count = self.toolbar.actions.len().max(1) as f32;
+            let tb_w = btn_w * count + gap * (count - 1.0) + pad * 2.0 + btn_h + gap; // +close btn
+            let tb_h = btn_h + pad * 2.0;
+
+            // Screen size in physical pixels (same space as the mouse hook).
+            let (screen_w_phys, screen_h_phys) = crate::platform::get_primary_monitor_size();
+
+            // egui's ViewportCommand::OuterPosition works in LOGICAL points, but
+            // the mouse hook gives us PHYSICAL pixels. On a 150% scaled display a
+            // logical coordinate of 1000 maps to 1500 physical pixels, so we must
+            // divide physical pixel coordinates by pixels_per_point before handing
+            // them to OuterPosition. Otherwise the window lands far from the mouse.
+            let ppp = ctx.input(|i| i.pixels_per_point()).max(0.0001);
+
+            let offset_x = 8.0; // physical px
+            let offset_y = 14.0; // physical px
+
+            // Target physical-pixel position for the window's top-left.
+            let x_phys = (self.toolbar.pos.0 as f32 + offset_x)
+                .min(screen_w_phys as f32 - tb_w * ppp - 4.0)
+                .max(4.0);
+            let y_phys = (self.toolbar.pos.1 as f32 + offset_y)
+                .min(screen_h_phys as f32 - tb_h * ppp - 4.0)
+                .max(4.0);
+
+            // Convert to logical points for egui.
+            let x_pos = x_phys / ppp;
+            let y_pos = y_phys / ppp;
+
+            // One-shot diagnostic so we can see the math at runtime.
+            if std::env::var_os("IntelliBoard_DIAG_TOOLBAR").is_some() {
+                log::info!(
+                    "[diag] toolbar anchor phys=({}, {}) screen_phys=({}, {}) ppp={} -> window logical=({:.0}, {:.0}) size=({:.0}x{:.0})",
+                    self.toolbar.pos.0, self.toolbar.pos.1,
+                    screen_w_phys, screen_h_phys, ppp,
+                    x_pos, y_pos, tb_w, tb_h
+                );
+            }
+
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([x_pos, y_pos].into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([tb_w, tb_h].into()));
+
+            // Record the window rect in PHYSICAL pixels so the keep-zone test
+            // (which compares against get_cursor_pos physical pixels) matches.
+            self.toolbar.rect = Some(egui::Rect::from_min_size(
+                egui::pos2(x_phys, y_phys),
+                egui::vec2(tb_w * ppp, tb_h * ppp),
+            ));
+
+            let frame = egui::Frame::default()
+                .fill(crate::ui::theme::SURFACE_3)
+                .stroke(egui::Stroke::new(STROKE_HAIRLINE, BORDER))
+                .rounding(egui::Rounding::same(RADIUS_MD))
+                .inner_margin(egui::Margin::same(pad));
+
+            egui::CentralPanel::default()
+                .frame(frame)
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    ui.horizontal(|ui| {
+                        for (id, label) in self.toolbar.actions.clone() {
+                            // Shorten label to fit the compact button (truncate to ~7 chars).
+                            let short = if label.chars().count() > 8 {
+                                let mut s: String = label.chars().take(7).collect();
+                                s.push('…');
+                                s
+                            } else {
+                                label.clone()
+                            };
+
+                            if ui.add_sized(
+                                [btn_w, btn_h],
+                                egui::Button::new(
+                                    egui::RichText::new(&short)
+                                        .color(TEXT_COLOR)
+                                        .size(11.0),
+                                )
+                                .fill(crate::ui::theme::SURFACE_2)
+                                .stroke(egui::Stroke::new(STROKE_HAIRLINE, BORDER))
+                                .rounding(egui::Rounding::same(RADIUS_SM)),
+                            ).clicked() {
+                                info!("Toolbar button clicked: {}", id);
+                                let trigger_text = self.toolbar.text.clone();
+                                if let Some(action) = crate::core::actions::Action::from_name(&id) {
+                                    // Ensure the clipboard holds the selected text so the
+                                    // action handler reads exactly what the user selected.
+                                    let _ = self.app_tx.try_send(AppEvent::SetClipboard(trigger_text));
+                                    let _ = self.app_tx.try_send(AppEvent::TriggerAction(action));
+                                }
+                                self.toolbar.visible = false;
+                            }
+                        }
+
+                        // Tiny close button on the right
+                        if ui.add_sized(
+                            [btn_h, btn_h],
+                            egui::Button::new(
+                                egui::RichText::new("✕").color(DANGER_TEXT).size(10.0),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(STROKE_HAIRLINE, BORDER))
+                            .rounding(egui::Rounding::same(RADIUS_SM)),
+                        ).clicked() {
+                            self.toolbar.visible = false;
+                        }
+                    });
+                });
+
+            // Escape closes the toolbar
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.toolbar.visible = false;
+            }
+
+            ctx.request_repaint();
+            return;
+        }
+
         // During WAITING ONLY, show small indicator bar at bottom
         // Once streaming starts, switch to the full result window
         let is_waiting = self.state == AppState::Waiting;
         
         if is_waiting {
-            // Show small processing indicator bar at bottom-center of screen
-            // Size: ~280x50 pixels, always on top
-            // Use monitor info for positioning - assume 1920x1080 as fallback
-            let bar_width = 280.0;
-            let bar_height = 50.0;
+            // Show small processing indicator bar at bottom-center of screen.
+            // Uses the token-based indicator frame: SURFACE_3 fill, accent ring,
+            // rounded corners, consistent padding. Previously a flat black rect
+            // with raw neon and sharp 4px corners — felt cheap.
+            let bar_width = BAR_W;
+            let bar_height = BAR_H;
             
             // Get primary monitor size (fallback to common resolution)
             let (screen_width, screen_height) = ctx.input(|i| {
@@ -360,16 +644,13 @@ impl eframe::App for MyApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([x_pos, y_pos].into()));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([bar_width, bar_height].into()));
             
-            // Processing bar frame
-            let frame = egui::Frame::default()
-                .fill(egui::Color32::from_rgb(10, 10, 16))
-                .rounding(4.0)
-                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 243, 255)))
-                .inner_margin(8.0);
+            // Token-based indicator frame (replaces ad-hoc Frame::default)
+            let frame = crate::ui::theme::indicator_frame();
             
             egui::CentralPanel::default()
                 .frame(frame)
                 .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.x = SPACE_4;
                     ui.horizontal(|ui| {
                         // Animated spinner/progress indicator
                         let time = ctx.input(|i| i.time);
@@ -390,17 +671,23 @@ impl eframe::App for MyApp {
                         
                         ui.label(
                             egui::RichText::new(format!("{}{}", label_text, dots))
-                                .color(egui::Color32::from_rgb(0, 243, 255))
-                                .size(14.0)
+                                .color(NEON_CYAN)
+                                .size(TEXT_MD)
                                 .monospace()
                         );
                         
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Stop button
-                            if ui.button(
-                                egui::RichText::new("✕")
-                                    .color(egui::Color32::from_rgb(255, 100, 100))
-                                    .size(14.0)
+                            // Stop button — sized control, soft danger text.
+                            if ui.add_sized(
+                                [CTRL_H_SM, CTRL_H_SM],
+                                egui::Button::new(
+                                    egui::RichText::new("✕")
+                                        .color(DANGER_TEXT)
+                                        .size(TEXT_MD)
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(STROKE_HAIRLINE, BORDER))
+                                .rounding(egui::Rounding::same(RADIUS_MD)),
                             ).clicked() {
                                 info!("User clicked stop button");
                                 let _ = self.app_tx.try_send(AppEvent::Cancel);
@@ -416,8 +703,11 @@ impl eframe::App for MyApp {
         }
 
         if !self.visible {
-            // Move off-screen and keep loop alive
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([10000.0, 10000.0].into()));
+            // Shrink to 1×1 instead of moving far off-screen, so next time the
+            // toolbar or result window positions itself the OS doesn't clamp the
+            // window from (10000,10000) to a random screen edge before our
+            // set_outer_position takes hold.
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([1.0, 1.0].into()));
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
             egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |_ui| {});
             return;
@@ -426,158 +716,165 @@ impl eframe::App for MyApp {
         // NOTE: Focus-based auto-close removed - window stays open until user explicitly closes it
         // or a new action is triggered (which cancels the old one and shows new UI)
         
-        // Result window - show full size popup for Finished/Error/Incomplete
-        // Move window to right side, proper size
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([1350.0, 250.0].into()));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([500.0, 700.0].into()));
+        // Result window - show full size popup for Finished/Error/Incomplete.
+        // Move window to right side, proper size.
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([RESULT_X, RESULT_Y].into()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([RESULT_W, RESULT_H].into()));
         
-        // Custom Frame for Japan 2046 look
-        let frame = egui::Frame::default()
-            .fill(egui::Color32::from_rgb(10, 10, 16)) // Deep Night
-            .rounding(0.0) // Sharp corners for tech look
-            .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 243, 255))) // Neon Cyan Border
-            .inner_margin(20.0);
+        // Token-based popup frame: rounded, soft accent ring (not raw neon),
+        // generous padding, elevated surface (SURFACE_3). Previously this was
+        // sharp 0px corners with a raw 2px cyan border on flat black — that read
+        // as low-quality. The rounded accent ring + elevated fill gives depth.
+        let frame = crate::ui::theme::popup_frame();
 
         egui::CentralPanel::default()
             .frame(frame)
             .show(ctx, |ui| {
                 let available_height = ui.available_height();
-                let input_height = available_height * 0.33;
-                let output_height = available_height * 0.66;
+                let input_height = available_height * 0.34;
+                let output_height = available_height - input_height - SPACE_4 * 2.0 - 1.0;
 
-                // Input Area (Top 1/3)
+                // Input Area (top portion)
                 ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), input_height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.horizontal_top(|ui| {
-                        let available_width = ui.available_width() - 30.0; // Reserve space for close button
-                        
-                        ui.vertical(|ui| {
-                            ui.set_max_width(available_width);
-                            
-                            if self.state == AppState::Waiting {
-                                // Hide input text during processing, show placeholder
-                                ui.label(
-                                    egui::RichText::new("INPUT LOCKED // 入力ロック中")
-                                        .color(egui::Color32::from_rgb(100, 100, 120))
-                                        .monospace()
-                                );
-                            } else {
-                                egui::ScrollArea::vertical()
-                                    .id_source("input_scroll")
-                                    .max_height((input_height - 30.0).max(10.0)) // Reserve space for header/buttons, ensure non-negative
-                                    .show(ui, |ui| {
-                                        let response = ui.add(
-                                            egui::TextEdit::multiline(&mut self.original_text)
-                                                .desired_width(available_width)
-                                                .font(egui::FontId::proportional(14.0))
-                                                .text_color(egui::Color32::from_rgb(220, 230, 255)) // Cool White
-                                                .frame(false) // Minimalist look
-                                        );
-
-                                        // Handle Enter to submit (Shift+Enter for newline)
-                                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
-                                            // Remove the newline that might have been added
-                                            if self.original_text.ends_with('\n') {
-                                                self.original_text.pop();
-                                            }
-                                            
-                                            info!("User submitted query: {}", self.original_text);
-                                            self.text.clear(); // Clear previous result
-                                            self.displayed_text.clear();
-                                            self.state = AppState::Waiting;
-                                            
-                                            // Send event to backend
-                                            let _ = self.app_tx.try_send(AppEvent::UserQuery(self.original_text.clone()));
-                                        }
-                                    });
+                    // Header bar: full-width row holding the status indicator on the
+                    // left and the close button on the right. This is a dedicated row
+                    // so it can never overlap the input text below it (was the cause
+                    // of the status pill sitting on top of the selected text).
+                    ui.horizontal(|ui| {
+                        // Status Indicator — status-tinted label (left).
+                        match self.state {
+                            AppState::Waiting => {
+                                ui.label(egui::RichText::new("待機").size(TEXT_MD).color(NEON_CYAN));
                             }
-                        });
+                            AppState::Streaming => {
+                                ui.label(egui::RichText::new("受信").size(TEXT_MD).color(NEON_CYAN));
+                            }
+                            AppState::Finished => {
+                                ui.label(egui::RichText::new("终章").size(TEXT_MD).color(SUCCESS));
+                            }
+                            AppState::Incomplete => {
+                                ui.label(egui::RichText::new("中断").size(TEXT_MD).color(WARN));
+                            }
+                            AppState::Error => {
+                                ui.label(egui::RichText::new("エラー").size(TEXT_MD).color(NEON_PINK));
+                            }
+                            AppState::Idle => {}
+                        }
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                            if ui.button(egui::RichText::new("❌").color(egui::Color32::from_rgb(255, 0, 60))).clicked() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Close button — sized control, danger-tinted, rounded.
+                            if ui.add_sized(
+                                [CTRL_H_SM, CTRL_H_SM],
+                                egui::Button::new(egui::RichText::new("✕").color(NEON_PINK).size(TEXT_MD))
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::new(STROKE_HAIRLINE, NEON_PINK.linear_multiply(0.6)))
+                                    .rounding(egui::Rounding::same(RADIUS_MD)),
+                            ).clicked() {
                                 info!("User clicked close button");
                                 let _ = self.app_tx.try_send(AppEvent::Cancel);
                                 self.visible = false;
                                 self.state = AppState::Idle;
                             }
-
-                            // Status Indicator
-                            let status_size = 14.0;
-                            match self.state {
-                                AppState::Waiting => {
-                                    ui.label(egui::RichText::new("待機").size(status_size).color(egui::Color32::from_rgb(0, 243, 255))); 
-                                }
-                                AppState::Streaming => {
-                                    ui.label(egui::RichText::new("受信").size(status_size).color(egui::Color32::from_rgb(0, 243, 255)));
-                                }
-                                AppState::Finished => {
-                                    ui.label(egui::RichText::new("终章").size(status_size).color(egui::Color32::from_rgb(0, 255, 65))); // Matrix Green
-                                }
-                                AppState::Incomplete => {
-                                    ui.label(egui::RichText::new("中断").size(status_size).color(egui::Color32::from_rgb(255, 200, 0))); // Gold
-                                }
-                                AppState::Error => {
-                                    ui.label(egui::RichText::new("エラー").size(status_size).color(egui::Color32::from_rgb(255, 0, 60))); // Red
-                                }
-                                AppState::Idle => {}
-                            }
                         });
                     });
+
+                    ui.add_space(SPACE_2);
+
+                    // Input text content — full width, below the header bar.
+                    if self.state == AppState::Waiting {
+                        // Hide input text during processing, show placeholder.
+                        ui.label(
+                            egui::RichText::new("INPUT LOCKED // 入力ロック中")
+                                .color(TEXT_MUTED)
+                                .size(TEXT_SM)
+                                .monospace()
+                        );
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_source("input_scroll")
+                            .max_height((input_height - 40.0).max(10.0))
+                            .show(ui, |ui| {
+                                let response = ui.add(
+                                    egui::TextEdit::multiline(&mut self.original_text)
+                                        .desired_width(ui.available_width())
+                                        .font(egui::FontId::proportional(TEXT_BASE))
+                                        .text_color(TEXT_COLOR)
+                                        .frame(false)
+                                );
+
+                                // Handle Enter to submit (Shift+Enter for newline)
+                                if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
+                                    if self.original_text.ends_with('\n') {
+                                        self.original_text.pop();
+                                    }
+                                    
+                                    info!("User submitted query: {}", self.original_text);
+                                    self.text.clear();
+                                    self.displayed_text.clear();
+                                    self.state = AppState::Waiting;
+                                    
+                                    let _ = self.app_tx.try_send(AppEvent::UserQuery(self.original_text.clone()));
+                                }
+                            });
+                    }
                 });
             
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(10.0);
+                ui.add_space(SPACE_4);
+                // Soft hairline divider instead of a heavy separator.
+                let (div_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                ui.painter().line_segment(
+                    [div_rect.left_center(), div_rect.right_center()],
+                    egui::Stroke::new(STROKE_HAIRLINE, BORDER),
+                );
+                ui.add_space(SPACE_4);
 
-                // Output Area (Remaining 2/3)
+                // Output Area (remaining height)
                 ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), output_height), egui::Layout::top_down(egui::Align::Min), |ui| {
                     egui::ScrollArea::vertical()
                         .id_source("output_scroll")
                         .show(ui, |ui| {
                             if self.state == AppState::Waiting {
-                                // Request repaint for animation
                                 ctx.request_repaint();
                                 ui.vertical_centered(|ui| {
-                                    ui.add_space(10.0);
-                                    // Cyberpunk loading text
-                                    ui.label(egui::RichText::new("SYSTEM PROCESSING // 解析中").monospace().color(egui::Color32::from_rgb(0, 243, 255))); 
-                                    ui.add_space(5.0);
+                                    ui.add_space(SPACE_4);
+                                    ui.label(egui::RichText::new("SYSTEM PROCESSING // 解析中").monospace().color(NEON_CYAN).size(TEXT_BASE)); 
+                                    ui.add_space(SPACE_3);
                                     
-                                    // Indeterminate progress bar
+                                    // Indeterminate scanner bar — rounded track + rounded moving
+                                    // segment, replacing the old sharp black/neon rectangles.
                                     let time = ctx.input(|i| i.time);
                                     let progress = (time * 1.5 % 1.0) as f32;
                                     
-                                    let bar_height = 20.0; // Fixed height ~0.7cm
+                                    let bar_height = 16.0;
                                     let width = ui.available_width() * 0.9;
                                     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, bar_height), egui::Sense::hover());
                                     
-                                    // Background line
-                                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 40));
+                                    // Track (elevated surface, rounded)
+                                    ui.painter().rect_filled(rect, egui::Rounding::same(RADIUS_MD), SURFACE_2);
                                     
-                                    // Moving scanner line
+                                    // Moving scanner segment (rounded)
                                     let bar_width = width * 0.3;
                                     let x_pos = rect.left() + (width - bar_width) * progress;
                                     let bar_rect = egui::Rect::from_min_size(
                                         egui::pos2(x_pos, rect.top()),
                                         egui::vec2(bar_width, bar_height)
                                     );
-                                    
-                                    ui.painter().rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(255, 0, 60));
-                                    ui.add_space(10.0);
+                                    ui.painter().rect_filled(bar_rect, egui::Rounding::same(RADIUS_MD), NEON_PINK);
+                                    ui.add_space(SPACE_4);
                                 });
                             } else {
                                 ui.label(
                                     egui::RichText::new(&self.displayed_text)
-                                        .color(egui::Color32::from_rgb(220, 230, 255)) // Cool White
-                                        .size(14.0)
+                                        .color(TEXT_COLOR)
+                                        .size(TEXT_BASE)
                                 );
                             }
                         });
                 });
         
-
             
                 // Footer (optional, maybe just space)
-                ui.add_space(5.0);
+                ui.add_space(SPACE_2);
             });
 
         // Close main UI on Escape (Memory Graph escape is handled earlier)

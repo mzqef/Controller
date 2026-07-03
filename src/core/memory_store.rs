@@ -735,6 +735,88 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Clear the entire graph: remove all items and all edges from memory and DB.
+    /// Used by the Memory Graph "Trash" button. Positions are reset implicitly
+    /// since the items themselves are gone.
+    pub fn clear_graph(&self) -> Result<()> {
+        info!("Clearing entire memory graph");
+        // Collect counts for logging BEFORE clearing.
+        let item_count = self.items.read().unwrap().len();
+        let edge_count = self.edges.read().unwrap().len();
+
+        // Clear in-memory state first.
+        self.items.write().unwrap().clear();
+        self.edges.write().unwrap().clear();
+
+        // Clear DB tables. Use an explicit transaction + commit so the delete
+        // is guaranteed durable before we return (a bare execute that fails to
+        // commit would leave rows in the DB, which is why cleared nodes
+        // reappeared after restart). VACUUM reclaims the freed pages too.
+        let mut conn = Connection::open(&self.db_path)?;
+        let tx = conn.transaction()?;
+        let removed_items = tx.execute("DELETE FROM memory_items", [])?;
+        let removed_edges = tx.execute("DELETE FROM memory_edges", [])?;
+        tx.commit()?;
+        // VACUUM must run outside a transaction.
+        let _ = conn.execute("VACUUM", []);
+
+        self.bump_revision();
+        info!(
+            "Memory graph cleared (in-memory: {} items, {} edges; DB rows deleted: {} items, {} edges)",
+            item_count, edge_count, removed_items, removed_edges
+        );
+        Ok(())
+    }
+
+    /// Add multiple user-linked edges in one batch (used by Auto Connect).
+    /// Each pair is (source_id, target_id). Skips pairs whose endpoints do not
+    /// both exist or where an identical user edge already exists. Returns the
+    /// number of edges actually added.
+    pub fn add_user_edges_batch(&self, pairs: Vec<(Uuid, Uuid)>) -> usize {
+        let existing: std::collections::HashSet<(Uuid, Uuid)> = {
+            let edges = self.edges.read().unwrap();
+            edges
+                .values()
+                .filter(|e| e.relation == RelationType::UserLinked)
+                .map(|e| (e.source_id, e.target_id))
+                .collect()
+        };
+        let items_present: std::collections::HashSet<Uuid> = {
+            let items = self.items.read().unwrap();
+            items.keys().copied().collect()
+        };
+        drop(existing);
+
+        let mut added = 0usize;
+        for (source_id, target_id) in pairs {
+            if !items_present.contains(&source_id) || !items_present.contains(&target_id) {
+                continue;
+            }
+            // Dedup against existing user edges (both directions to avoid mirrors).
+            {
+                let edges = self.edges.read().unwrap();
+                let already = edges.values().any(|e| {
+                    e.relation == RelationType::UserLinked
+                        && ((e.source_id == source_id && e.target_id == target_id)
+                            || (e.source_id == target_id && e.target_id == source_id))
+                });
+                if already {
+                    continue;
+                }
+            }
+            let edge = MemoryEdge::new(source_id, target_id, RelationType::UserLinked);
+            let id = edge.id;
+            self.edges.write().unwrap().insert(id, edge);
+            let _ = self.persist_edge(id);
+            added += 1;
+        }
+        if added > 0 {
+            self.bump_revision();
+        }
+        info!("Auto Connect: added {} user edges", added);
+        added
+    }
+
     /// Update an item's title. Persists to SQLite for all item types.
     pub fn update_item_title(&self, id: Uuid, title: String) {
         let item_exists = {

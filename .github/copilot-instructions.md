@@ -40,9 +40,9 @@ Short, focused guidance for AI coding agents working in this repo. Keep changes 
 - LLM client patterns: `src/api/client.rs` (streaming, timeout behavior).
 
 ### UiEvent examples & lifecycle
-- `UiEvent` enum is declared in `src/ui.rs` and contains these variants: `ProcessingStarted(String)`, `ShowResult(String, String)`, `StreamUpdate(String)`, `StreamEnd(bool)`, `StreamError(String)`, `ShowMemoryGraph`, `ShowHotkeyConfig`, `Quit` — see [src/ui.rs](src/ui.rs#L25).
+- `UiEvent` enum is declared in `src/ui.rs` and contains these variants: `ProcessingStarted(String, String)`, `ShowResult(String, String)`, `StreamUpdate(String)`, `StreamEnd(bool)`, `StreamError(String)`, `ShowMemoryGraph`, `ShowHotkeyConfig`, `Quit` — see [src/ui.rs](src/ui.rs#L25).
 - Common send sites (examples):
-	- Backend signals start: `ui_tx.send(UiEvent::ProcessingStarted(label))` — example in [src/core/actions.rs](src/core/actions.rs).
+	- Backend signals start: `ui_tx.send(UiEvent::ProcessingStarted(label, original_text))` — example in [src/core/actions.rs](src/core/actions.rs).
 	- Backend returns final result: `ui_tx.send(UiEvent::ShowResult(original, processed))` — example in [src/core/actions.rs](src/core/actions.rs).
 	- Backend reports an error: `ui_tx.send(UiEvent::StreamError(e.to_string()))` — example in [src/core/actions.rs](src/core/actions.rs).
 	- LLM streaming chunks: `tx.try_send(crate::ui::UiEvent::StreamUpdate(content))` inside the streaming loop — see [src/api/client.rs](src/api/client.rs).

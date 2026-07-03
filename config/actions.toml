@@ -27,8 +27,8 @@ temperature = 0.1
 timeout_ms = 60000
 
 [defaults.local]
-api_url = "http://127.0.0.1:8000/api/v1/chat/completions"
-model = "Qwen3-4B-Hybrid"
+api_url = "http://127.0.0.1:52625/v1/chat/completions"
+model = "gemma4-it:e2b"
 
 # Force local LLM for all actions (set to true for offline mode)
 force_local = false
@@ -174,6 +174,26 @@ prompt = """Structure the following text into JSONL."""
 [actions.local]
 prompt = """Structure the following text into JSONL."""
 
+# ----------------------------------------------------------------------------
+# Connect - Auto-connect related memory items via AI (used by Memory Graph)
+# ----------------------------------------------------------------------------
+# Internal action invoked by the Memory Graph "Auto Connect" button. Sends a
+# numbered catalogue of memory items and expects a JSON array of related index
+# pairs back, e.g. [[1,3],[2,5]]. Hidden from the hotkey dropdown by default.
+[[actions]]
+id = "connect"
+label = "Auto Connect"
+description = "Auto-connect related memory items via AI"
+hidden = true
+
+[actions.remote]
+temperature = 0.1
+prompt = """You are analysing a knowledge graph of memory items.
+Return ONLY a JSON array of related index pairs, e.g. [[1,3],[2,5]]. Use 1-based indices. No explanation."""
+
+[actions.local]
+prompt = """Return ONLY a JSON array of related index pairs [[i,j]], 1-based. No explanation."""
+
 # ============================================================================
 # ADDING CUSTOM ACTIONS
 # ============================================================================
@@ -198,7 +218,7 @@ prompt = """Structure the following text into JSONL."""
 # any_extra_field = "value"     # Extra fields passed to API
 #
 # [actions.local]
-# model = "Qwen3-4B-Hybrid"     # Optional: override local model
+# model = "gemma4-it:e2b"            # Optional: override local model
 # prompt = "Shorter prompt"     # Local models often need simpler prompts
 #
 # Then bind to a hotkey in config/hotkeys.toml:

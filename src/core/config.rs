@@ -373,8 +373,8 @@ impl Default for ActionsConfig {
                 temperature: Some(0.1),
                 timeout_ms: Some(60000),
                 local: Some(ActionLocalConfig {
-                    api_url: Some("http://127.0.0.1:8000/api/v1/chat/completions".to_string()),
-                    model: Some("Qwen3-4B-Hybrid".to_string()),
+                    api_url: Some("http://127.0.0.1:52625/v1/chat/completions".to_string()),
+                    model: Some("gemma4-it:e2b".to_string()),
                     prompt: None,
                     extra: HashMap::new(),
                 }),
@@ -440,6 +440,33 @@ impl Default for ActionsConfig {
                     });
                     a
                 },
+                // Internal action used by Memory Graph "Auto Connect". Hidden
+                // from the hotkey dropdown — it is invoked programmatically with
+                // a numbered item catalogue and expects a JSON array of index
+                // pairs back. Users can customise its model/prompt in the
+                // Functions Config UI under AI Actions.
+                {
+                    let mut a = ActionDefinition::new("connect", Some("Auto Connect"));
+                    a.description = "Auto-connect related memory items via AI".to_string();
+                    a.hidden = true;
+                    a.remote = Some(ActionRemoteConfig {
+                        prompt: Some(
+                            "You are analysing a knowledge graph of memory items.\n\
+Return ONLY a JSON array of related index pairs, e.g. [[1,3],[2,5]]. Use 1-based indices. No explanation."
+                                .to_string(),
+                        ),
+                        temperature: Some(0.1),
+                        ..Default::default()
+                    });
+                    a.local = Some(ActionLocalConfig {
+                        prompt: Some(
+                            "Return ONLY a JSON array of related index pairs [[i,j]], 1-based. No explanation."
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    });
+                    a
+                },
             ],
         }
     }
@@ -467,6 +494,9 @@ fn load_actions_from_file(path: &std::path::Path) -> Option<ActionsConfig> {
 pub fn load_actions_config() -> Result<ActionsConfig> {
     // Load default config from repo
     let default_path = PathBuf::from("config/actions.toml");
+    if default_path.exists() {
+        info!("Loading actions config from {}", default_path.display());
+    }
     let mut config = load_actions_from_file(&default_path).unwrap_or_default();
     
     // Load user overrides
@@ -475,6 +505,7 @@ pub fn load_actions_config() -> Result<ActionsConfig> {
         user_dir.push("actions.toml");
         
         if let Some(user_config) = load_actions_from_file(&user_dir) {
+            info!("Applying user actions override from {}", user_dir.display());
             // Merge user config into default:
             // - User defaults override repo defaults
             if user_config.defaults.api_url.is_some() {
@@ -513,7 +544,10 @@ pub fn load_actions_config() -> Result<ActionsConfig> {
         action.migrate_to_nested();
     }
     
-    info!("Loaded {} actions from config", config.actions.len());
+    let local_model = config.defaults.local.as_ref()
+        .and_then(|local| local.model.as_deref())
+        .unwrap_or("<unset>");
+    info!("Loaded {} actions from config (default local model: {})", config.actions.len(), local_model);
     Ok(config)
 }
 

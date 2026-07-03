@@ -92,9 +92,9 @@ impl ActionHandler {
         if let Action::Vision { action_id, image_base64 } = &action {
             let label = self.get_action_label(action_id);
             
-            // Send UI update with action label
+            // Send UI update with action label and a placeholder for the image input.
             if let Some(tx) = &self.ui_tx {
-                let _ = tx.send(UiEvent::ProcessingStarted(label));
+                let _ = tx.send(UiEvent::ProcessingStarted(label, "[Image]".to_string()));
             }
             
             // Execute vision action
@@ -171,9 +171,10 @@ impl ActionHandler {
         // Get action label for UI
         let label = self.get_action_label(&action_id);
 
-        // Send UI update "Processing..." with action label
+        // Send UI update "Processing..." with action label and the original input text
+        // so the result window shows the correct input as soon as it pops up.
         if let Some(tx) = &self.ui_tx {
-            let _ = tx.send(UiEvent::ProcessingStarted(label));
+            let _ = tx.send(UiEvent::ProcessingStarted(label, text.clone()));
         }
 
         // Execute the action via LLM client

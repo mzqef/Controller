@@ -1,4 +1,3 @@
 [commands]
 "Exam" = "C:/Users/mzqef/OneDrive/Projects/exam/run.bat"
-"AlexResearcher" = "python C:/Users/mzqef/OneDrive/Projects/OpenAlexResearcher/query.py"
-"Run Qwen3-4B" = "Start-Process powershell -ArgumentList '-Command', 'lemonade-server run Qwen3-4B-Hybrid --port 8000' -WindowStyle Hidden"
+"Run Local Model" = "Start-Process powershell -ArgumentList '-Command', 'D:/flm/flm serve gemma4-it:e2b --pmode powersaver --host 127.0.0.1 --port 52625' -WindowStyle Hidden"

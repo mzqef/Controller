@@ -123,7 +123,7 @@ classDiagram
     
     class UiEvent {
         <<enumeration>>
-        ProcessingStarted(String)
+        ProcessingStarted(String, String)
         ShowResult(String, String)
         StreamUpdate(String)
         StreamEnd(bool)

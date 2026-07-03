@@ -12,6 +12,13 @@ pub enum GraphRequest {
     DeleteItem { id: Uuid },
     /// Clear all stored positions (used by Auto Align)
     ClearAllPositions,
+    /// Clear the entire graph: all items and all edges (used by Trash button)
+    ClearGraph,
+    /// Auto-connect unconnected nodes via AI. The server side gathers all
+    /// item summaries, asks the LLM which pairs are related, and adds the
+    /// resulting edges as UserLinked. The client waits for the refreshed
+    /// snapshot returned in the response.
+    AutoConnectEdges,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

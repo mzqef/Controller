@@ -5,9 +5,17 @@ use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-const NODE_RADIUS: f32 = 35.0;
-const NODE_SPACING_Y: f32 = 90.0;
-const COLUMN_SPACING: f32 = 250.0;
+// Design tokens (see src/ui/theme.rs). The graph canvas is custom-painted, so
+// we pull the canonical type/spacing scale here to keep the toolbar and labels
+// in lock-step with the rest of the app.
+use crate::ui::theme::{
+    SPACE_4,
+    TEXT_XS, TEXT_SM,
+};
+
+const NODE_RADIUS: f32 = 38.0;       // was 35 — slightly larger for better label breathing room
+const NODE_SPACING_Y: f32 = 96.0;    // was 90 — matches new radius + padding
+const COLUMN_SPACING: f32 = 260.0;   // was 250 — matches new node diameter + gap
 const DEFAULT_LIMIT_PER_TIER: usize = 10;
 
 /// Ghost node for dangling edge sources (items lost on reboot)
@@ -58,6 +66,20 @@ pub struct MemoryGraphView {
     // Export feedback for user (time, message, is_success)
     export_feedback: Option<(std::time::Instant, String, bool)>,
     
+    // Generic operation feedback (Auto Connect / Clear), reuses the same
+    // (time, message, is_success) shape as export_feedback.
+    op_feedback: Option<(std::time::Instant, String, bool)>,
+    
+    // True while an Auto Connect request is in flight (disables the button).
+    auto_connect_pending: bool,
+    // When the in-flight Auto Connect request started, for a safety timeout.
+    auto_connect_started_at: Option<std::time::Instant>,
+
+    // Two-step confirmation for the Clear (trash) button. When true, the next
+    // click within `confirm_clear_at` + 3s actually clears the graph.
+    confirm_clear: bool,
+    confirm_clear_at: std::time::Instant,
+    
     // Configured export path (from config)
     export_path: Option<String>,
     
@@ -97,6 +119,11 @@ impl MemoryGraphView {
             marquee_current: None,
             force_default_layout: false,
             export_feedback: None,
+            op_feedback: None,
+            auto_connect_pending: false,
+            auto_connect_started_at: None,
+            confirm_clear: false,
+            confirm_clear_at: std::time::Instant::now(),
             export_path,
             mutations: Vec::new(),
         }
@@ -119,6 +146,18 @@ impl MemoryGraphView {
             .collect();
         self.refresh_ghost_nodes();
         self.reflow_layout(); // Recalculate layout with new data
+
+        // A fresh snapshot arrived. If an Auto Connect request was in flight,
+        // the AI-derived edges are now baked into this snapshot, so we can
+        // clear the pending flag and surface a completion message. Without
+        // this, the button would re-enable on the next frame (mutations drained)
+        // long before the LLM responded, so the user could not tell it was
+        // still running.
+        if self.auto_connect_pending {
+            self.auto_connect_pending = false;
+            self.auto_connect_started_at = None;
+            self.op_feedback = Some((std::time::Instant::now(), "Auto Connect done".to_string(), true));
+        }
     }
 
     pub fn drain_mutations(&mut self) -> Vec<GraphRequest> {
@@ -273,8 +312,10 @@ impl MemoryGraphView {
     pub fn draw(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Cache refresh is now driven by external data setter
        
-        // Top toolbar
+        // Top toolbar — styled to match the Functions Config window: consistent
+        // item spacing (SPACE_4), token-typed buttons, and feedback pills.
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = SPACE_4;
             ui.checkbox(&mut self.show_short_term, "📋 Short-term");
             ui.checkbox(&mut self.show_mid_term, "🔄 Mid-term");
             ui.checkbox(&mut self.show_long_term, "💾 Long-term");
@@ -282,37 +323,119 @@ impl MemoryGraphView {
             
             ui.label("🔍");
             ui.add(egui::TextEdit::singleline(&mut self.search_query)
-                .desired_width(150.0)
+                .desired_width(180.0)
                 .hint_text("Search..."));
             
             ui.separator();
             
-            if ui.button("Auto Align").clicked() {
+            if ui.button("Auto Align")
+                .on_hover_text("Reset all node positions to the default three-column tier layout.") 
+                .clicked() {
                 // Set flag to ignore persisted positions on next reflow
                 self.force_default_layout = true;
                 self.node_positions.clear();
                 // Clear server-side positions so they don't overwrite on next snapshot
                 self.mutations.push(GraphRequest::ClearAllPositions);
                 self.reflow_layout();
+                self.op_feedback = Some((std::time::Instant::now(), "Realigned".to_string(), true));
             }
-            if ui.button("Export").clicked() {
+            // Auto Connect — ask the AI to link related but unconnected nodes.
+            // Disabled while a request is in flight so the user can see it is
+            // still running (the flag is cleared in set_data when the refreshed
+            // snapshot arrives).
+            let connect_enabled = !self.auto_connect_pending && !self.cached_items.is_empty();
+            let connect_label = if self.auto_connect_pending {
+                "Auto Connect…" // ellipsis signals in-progress
+            } else {
+                "Auto Connect"
+            };
+            if ui.add_enabled(connect_enabled, egui::Button::new(connect_label))
+                .on_hover_text("Ask the AI to find related items and draw edges between them. Runs the \"connect\" action.") 
+                .clicked() {
+                self.auto_connect_pending = true;
+                self.auto_connect_started_at = Some(std::time::Instant::now());
+                self.mutations.push(GraphRequest::AutoConnectEdges);
+                self.op_feedback = Some((std::time::Instant::now(), "Connecting…".to_string(), true));
+            }
+            // Persistent in-progress indicator: stays visible until the snapshot
+            // returns (the 3-second fading pill alone was too brief to convey a
+            // long-running LLM call).
+            if self.auto_connect_pending {
+                ui.colored_label(Color32::from_rgb(0, 200, 230), "Connecting…");
+                // Keep repainting so the spinner/label stays live.
+                ctx.request_repaint();
+            }
+            // Trash — clear the entire graph (items + edges). Two-step confirm
+            // (click Clear, then click again within 3s) to avoid data loss.
+            if ui.button("Clear")
+                .on_hover_text("Remove ALL items and edges from the graph (memory + storage). Click twice to confirm.") 
+                .clicked() {
+                if self.confirm_clear {
+                    self.mutations.push(GraphRequest::ClearGraph);
+                    self.selected_nodes.clear();
+                    self.node_positions.clear();
+                    self.op_feedback = Some((std::time::Instant::now(), "Graph cleared".to_string(), true));
+                    self.confirm_clear = false;
+                } else {
+                    self.confirm_clear = true;
+                    self.confirm_clear_at = std::time::Instant::now();
+                }
+            }
+            // Reset the confirm flag after a timeout so a stray click does not
+            // linger as a dangerous "armed" state.
+            if self.confirm_clear && self.confirm_clear_at.elapsed().as_secs() > 3 {
+                self.confirm_clear = false;
+            }
+
+            if ui.button("Export")
+                .on_hover_text("Save the graph (items + edges) as a JSON file to your Downloads folder or configured export path.") 
+                .clicked() {
                 self.export_graph(None);
             }
             
-            // Show export feedback (fades after 3 seconds)
-            if let Some((time, ref msg, is_success)) = self.export_feedback {
+            // Show export / op feedback (fades after 3 seconds). Op feedback is
+            // checked first so Auto Connect / Clear messages surface promptly.
+            let mut feedback_text: Option<(egui::Color32, String)> = None;
+            if let Some((time, ref msg, is_success)) = self.op_feedback {
                 let elapsed = time.elapsed().as_secs_f32();
                 if elapsed < 3.0 {
                     let alpha = ((3.0 - elapsed) / 3.0 * 255.0) as u8;
                     let color = if is_success {
-                        Color32::from_rgba_unmultiplied(100, 255, 100, alpha)
+                        Color32::from_rgba_unmultiplied(0, 200, 230, alpha)
                     } else {
                         Color32::from_rgba_unmultiplied(255, 100, 100, alpha)
                     };
-                    ui.colored_label(color, msg);
+                    feedback_text = Some((color, msg.clone()));
                 } else {
-                    self.export_feedback = None;
+                    self.op_feedback = None;
                 }
+            }
+            if feedback_text.is_none() {
+                if let Some((time, ref msg, is_success)) = self.export_feedback {
+                    let elapsed = time.elapsed().as_secs_f32();
+                    if elapsed < 3.0 {
+                        let alpha = ((3.0 - elapsed) / 3.0 * 255.0) as u8;
+                        let color = if is_success {
+                            Color32::from_rgba_unmultiplied(100, 255, 100, alpha)
+                        } else {
+                            Color32::from_rgba_unmultiplied(255, 100, 100, alpha)
+                        };
+                        feedback_text = Some((color, msg.clone()));
+                    } else {
+                        self.export_feedback = None;
+                    }
+                }
+            }
+            if let Some((color, msg)) = feedback_text {
+                ui.colored_label(color, msg);
+            }
+
+            // Confirm-clear hint
+            if self.confirm_clear {
+                ui.colored_label(
+                    Color32::from_rgb(255, 200, 0),
+                    "Click Clear again to confirm",
+                );
             }
             
             if self.edge_creation_source.is_some() {
@@ -320,47 +443,72 @@ impl MemoryGraphView {
             }
         });
 
+        // NOTE: the auto_connect_pending flag is cleared in set_data() when the
+        // refreshed snapshot arrives — NOT here. Clearing it as soon as the
+        // mutation queue drained would re-enable the button within a frame,
+        // long before the LLM responds, so the user could not tell the request
+        // was still running.
+        // Safety net: if no snapshot returns within 90s (LLM hung or request
+        // dropped), give up so the button does not stay disabled forever.
+        if self.auto_connect_pending {
+            if let Some(started) = self.auto_connect_started_at {
+                if started.elapsed().as_secs() > 90 {
+                    self.auto_connect_pending = false;
+                    self.auto_connect_started_at = None;
+                    self.op_feedback = Some((std::time::Instant::now(), "Auto Connect timed out".to_string(), false));
+                }
+            }
+        }
+
         ui.separator();
 
-        // Legend with ghost indicator
+        // Legend / status bar — single row that doubles as the legend and the
+        // per-tier item counts, so the toolbar stays compact (was two crowded
+        // rows). Each tier chip shows "icon label: count", and the "Load more"
+        // action is a labelled control with a tooltip instead of a bare "+10".
         ui.horizontal(|ui| {
-            ui.label("Legend:");
-            ui.colored_label(Color32::from_rgb(0, 200, 255), "● Short-term");
-            ui.colored_label(Color32::from_rgb(255, 200, 0), "● Mid-term");
-            ui.colored_label(Color32::from_rgb(0, 255, 100), "● Long-term");
-            ui.colored_label(Color32::from_rgb(100, 100, 100), "◌ Ghost");
-            ui.separator();
-            ui.colored_label(Color32::from_rgb(255, 100, 255), "→ Translated");
-            ui.colored_label(Color32::from_rgb(100, 200, 255), "→ Explained");
-            ui.colored_label(Color32::from_rgb(255, 150, 100), "→ Formatted");
-            ui.colored_label(Color32::from_rgb(0, 255, 100), "→ Promoted");
-        });
+            ui.spacing_mut().item_spacing.x = SPACE_4;
 
-        // Load More buttons per tier
-        ui.horizontal(|ui| {
+            // Tier legend + counts (colour dot doubles as the legend marker).
             let short_count = self.cached_items.iter().filter(|i| i.memory_type == MemoryType::ShortTerm).count();
             let mid_count = self.cached_items.iter().filter(|i| i.memory_type == MemoryType::MidTerm).count();
             let long_count = self.cached_items.iter().filter(|i| i.memory_type == MemoryType::LongTerm).count();
-            
-            ui.label(format!("📋 Short: {}", short_count));
-            if ui.small_button("+10").clicked() {
+
+            ui.label(egui::RichText::new(format!("● Short: {}", short_count)).color(Color32::from_rgb(0, 200, 255)).size(TEXT_SM));
+            if ui.small_button("Load +10").on_hover_text("Show up to 10 more Short-term items in the graph.").clicked() {
                 self.short_term_limit += 10;
-                // Client must assume next snapshot request will honor this, 
-                // but for now we rely on the main process to just send what it sends.
-                // We should probably send component limits in GetSnapshot if we want this.
             }
             ui.separator();
-            
-            ui.label(format!("🔄 Mid: {}", mid_count));
-            if ui.small_button("+10").clicked() {
+
+            ui.label(egui::RichText::new(format!("● Mid: {}", mid_count)).color(Color32::from_rgb(255, 200, 0)).size(TEXT_SM));
+            if ui.small_button("Load +10").on_hover_text("Show up to 10 more Mid-term items in the graph.").clicked() {
                 self.mid_term_limit += 10;
             }
             ui.separator();
-            
-            ui.label(format!("💾 Long: {}", long_count));
-            if ui.small_button("+10").clicked() {
+
+            ui.label(egui::RichText::new(format!("● Long: {}", long_count)).color(Color32::from_rgb(0, 255, 100)).size(TEXT_SM));
+            if ui.small_button("Load +10").on_hover_text("Show up to 10 more Long-term items in the graph.").clicked() {
                 self.long_term_limit += 10;
             }
+            ui.separator();
+
+            // Edge relation legend (collapsed hint + tooltip listing the keys).
+            ui.menu_button(egui::RichText::new("Edges").size(TEXT_SM), |ui| {
+                ui.set_min_width(160.0);
+                ui.colored_label(Color32::from_rgb(255, 100, 255), "→ Translated");
+                ui.colored_label(Color32::from_rgb(100, 200, 255), "→ Explained");
+                ui.colored_label(Color32::from_rgb(255, 150, 100), "→ Formatted");
+                ui.colored_label(Color32::from_rgb(0, 255, 100), "→ Promoted");
+            });
+
+            // "Lost" (ghost) indicator — renamed from the opaque "Ghost" with a
+            // tooltip explaining what these nodes are (edge sources that no
+            // longer exist, lost on reboot). The dashed grey circles are
+            // rendered for orphaned edge endpoints only.
+            let ghost_lbl = ui.colored_label(Color32::from_rgb(120, 120, 130), "◌ Lost");
+            ghost_lbl.on_hover_text(
+                "\"Lost\" nodes are edge sources that no longer exist in memory — the connected item was deleted or lost on reboot. Drawn as a dashed grey circle. They are kept only so the edges remain visible; deleting the edge removes them."
+            );
         });
 
         ui.separator();
@@ -513,15 +661,35 @@ impl MemoryGraphView {
                     base_color
                 };
 
-                // Shadow
+                // Shadow — two-layer soft shadow (deeper, more "elevated" than the
+                // old single 3px/alpha-80 offset). Layer 1 is a soft outer wash;
+                // layer 2 is a tighter, darker core directly under the node.
                 painter.circle_filled(
-                    screen_pos + Vec2::new(3.0, 3.0),
+                    screen_pos + Vec2::new(2.0, 4.0),
+                    node_radius + 2.0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 60),
+                );
+                painter.circle_filled(
+                    screen_pos + Vec2::new(1.0, 2.0),
                     node_radius,
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 80),
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 110),
                 );
                 
+                // Soft accent glow ring behind the node (subtle cyan aura). This
+                // is what gives the nodes "energy" without a hard neon outline.
+                // Skipped when zoomed out to avoid clutter at small scales.
+                if self.zoom > 0.6 {
+                    painter.circle_filled(
+                        screen_pos,
+                        node_radius + 4.0,
+                        Color32::from_rgba_unmultiplied(0, 200, 230, 22),
+                    );
+                }
+                
                 painter.circle_filled(screen_pos, node_radius, fill_color);
-                painter.circle_stroke(screen_pos, node_radius, Stroke::new(2.0, Color32::WHITE));
+                // Node outline — slightly thicker at higher zoom for crispness.
+                let outline_w = (2.0 * self.zoom).clamp(1.5, 3.0);
+                painter.circle_stroke(screen_pos, node_radius, Stroke::new(outline_w, Color32::WHITE));
 
                 // Label: prefer full title; otherwise show first 3 words of content
                 let raw_label = if let Some(t) = item.title.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -540,7 +708,7 @@ impl MemoryGraphView {
                     screen_pos,
                     egui::Align2::CENTER_CENTER,
                     &label,
-                    FontId::proportional(11.0 * self.zoom),
+                    FontId::proportional(TEXT_XS * self.zoom),
                     Color32::BLACK,
                 );
             }
@@ -561,7 +729,7 @@ impl MemoryGraphView {
                 screen_pos,
                 egui::Align2::CENTER_CENTER,
                 "👻",
-                FontId::proportional(14.0 * self.zoom),
+                FontId::proportional(TEXT_SM * self.zoom),
                 ghost_color,
             );
         }
