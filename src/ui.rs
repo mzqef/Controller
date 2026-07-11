@@ -1019,6 +1019,7 @@ impl eframe::App for MyApp {
 // ---------------------------------------------------------------------------
 
 /// Look up an executable by name in `$PATH`. Returns its full path if found.
+#[allow(dead_code)]
 fn which(name: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
@@ -1046,6 +1047,7 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 
 /// Find an available terminal emulator on Linux/macOS.
 /// Returns the binary name if one is found in `$PATH`.
+#[allow(dead_code)]
 fn find_terminal_emulator() -> Option<&'static str> {
     const TERMINALS: &[&str] = &[
         "x-terminal-emulator", // Debian / Ubuntu

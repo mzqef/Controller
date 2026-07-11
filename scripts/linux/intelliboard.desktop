@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=IntelliBoard
+GenericName=Clipboard AI Assistant
+Comment=Intercept clipboard text and enhance it with LLM-powered fixes, translations, and explanations.
+# Edit these paths to match your installation location.
+Exec=/opt/intelliboard/IntelliBoard
+Icon=/opt/intelliboard/resources/icon.png
+Terminal=false
+Type=Application
+Categories=Utility;Office;TextTools;
+StartupNotify=true
+StartupWMClass=IntelliBoard
