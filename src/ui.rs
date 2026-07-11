@@ -57,6 +57,12 @@ pub enum UiEvent {
     /// Pop up the floating action toolbar near the selection. Carries the
     /// currently-selected text and the screen position (x, y) where the
     /// toolbar should anchor.
+    ///
+    /// TRIGGER POLICY: this event is sent ONLY from the clipboard-copy path
+    /// in `main.rs` (after a stable, non-programmatic copy of meaningful
+    /// text). There is no separate "mouse-selection-release" trigger — the
+    /// toolbar appears after the user *copies* text, not after they merely
+    /// select it.
     ShowActionToolbar { text: String, x: i32, y: i32 },
     Quit,
 }
@@ -133,6 +139,10 @@ pub struct MyApp {
     toolbar: ToolbarState,
     /// Shared actions config so the toolbar can render the current function list.
     shared_actions: Arc<std::sync::RwLock<crate::core::config::ActionsConfig>>,
+    /// Previous-frame left-mouse-button state, used for press→release
+    /// (click) edge detection in the result-window "click outside to
+    /// close" logic. See `check_click_outside_to_close`.
+    was_left_mouse_down: bool,
 }
 
 impl MyApp {
@@ -178,6 +188,7 @@ impl MyApp {
             current_action_label: String::new(),
             toolbar: ToolbarState { actions, ..Default::default() },
             shared_actions,
+            was_left_mouse_down: false,
         }
     }
 }
@@ -226,7 +237,37 @@ impl eframe::App for MyApp {
                     if let Some(latest) = logs.last() {
                         let path = latest.path();
                         #[cfg(target_os = "windows")]
-                        let _ = std::process::Command::new("notepad").arg(path).spawn();
+                        {
+                            let _ = std::process::Command::new("notepad").arg(&path).spawn();
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            // Try common Linux/macOS editors / openers.
+                            for opener in &[
+                                "xdg-open", // Linux default
+                                "open",     // macOS
+                                "geany",
+                                "gedit",
+                                "kate",
+                                "nano",
+                            ] {
+                                if which(opener).is_some() {
+                                    // Terminal-based editors need a terminal host.
+                                    if opener == &"nano" {
+                                        let _ = std::process::Command::new("xterm")
+                                            .arg("-e")
+                                            .arg(opener)
+                                            .arg(&path)
+                                            .spawn();
+                                    } else {
+                                        let _ = std::process::Command::new(opener)
+                                            .arg(&path)
+                                            .spawn();
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             } else if event.id == handler.hotkey_config_id {
@@ -235,9 +276,33 @@ impl eframe::App for MyApp {
             } else if let Some(cmd) = handler.custom_commands.get(&event.id) {
                 info!("Executing custom command: {}", cmd);
                 #[cfg(target_os = "windows")]
-                let _ = std::process::Command::new("wt.exe")
-                    .args(&["-p", "Windows PowerShell", "-d", ".", "powershell", "-Command", cmd])
-                    .spawn();
+                {
+                    let _ = std::process::Command::new("wt.exe")
+                        .args(&["-p", "Windows PowerShell", "-d", ".", "powershell", "-Command", cmd])
+                        .spawn();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // On Linux/macOS, run the command in an available terminal
+                    // emulator so the user sees output. Falls back to a plain
+                    // shell if no terminal is found.
+                    let term = find_terminal_emulator();
+                    if let Some(term) = term {
+                        let _ = std::process::Command::new(&term)
+                            .arg("-e")
+                            .arg("sh")
+                            .arg("-c")
+                            .arg(cmd)
+                            .spawn();
+                    } else {
+                        // No terminal found — run directly (output goes nowhere
+                        // but at least the command executes).
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(cmd)
+                            .spawn();
+                    }
+                }
             }
         }
 
@@ -325,6 +390,13 @@ impl eframe::App for MyApp {
                         // Move to result window position/size
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([RESULT_X, RESULT_Y].into()));
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize([RESULT_W, RESULT_H].into()));
+                        // Bring forward once so the result window appears above the
+                        // previously-focused app. WindowLevel will already be Normal
+                        // here (Streaming != Waiting), so without this Focus() the
+                        // newly-expanded window could land behind the foreground app.
+                        if std::env::var_os("IntelliBoard_NO_UI_FOCUS").is_none() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
                     }
                     ctx.request_repaint();
                 }
@@ -413,6 +485,37 @@ impl eframe::App for MyApp {
             }
         }
 
+        // Window level (Z-order) dispatch.
+        //
+        // The same egui viewport is reused for three different surfaces. They
+        // get different Z-order behaviour depending on what's currently shown:
+        //
+        //   - Result window (Finished / Error / Incomplete / Streaming with
+        //     `self.visible`) : Normal level. It's brought forward by an
+        //     explicit `ViewportCommand::Focus` at the moment the result
+        //     arrives (see ShowResult above), so it pops to the front once and
+        //     then lets the user raise other windows above it. This matches the
+        //     UX expectation: it doesn't *stay* on top forever.
+        //   - Status bar (Waiting) and selection toolbar : AlwaysOnTop. These
+        //     are short-lived overlays that must sit on top of the focused app
+        //     until they dismiss themselves.
+        //
+        // Sending the command every frame is cheap (egui coalesces identical
+        // commands) and lets transitions happen immediately on state change.
+        if std::env::var_os("IntelliBoard_NO_TOPMOST").is_none() {
+            // Only request topmost for surfaces that genuinely need it. The
+            // result window falls back to Normal so it can drop behind other
+            // windows after the initial Focus().
+            let want_topmost = (self.state == AppState::Waiting)
+                || (self.toolbar.visible && self.state == AppState::Idle);
+            let target_level = if want_topmost {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(target_level));
+        }
+
         // Typewriter Effect Logic - fast streaming display
         // Goal: Display new content quickly while maintaining smooth animation feel
         if self.state == AppState::Streaming && self.displayed_text.len() < self.text.len() {
@@ -499,14 +602,28 @@ impl eframe::App for MyApp {
         }
 
         if self.toolbar.visible && self.state == AppState::Idle {
-            // Compact geometry: small pill, tight padding, short labels.
-            let btn_w = 56.0;
-            let btn_h = 26.0;
-            let gap = 2.0;
-            let pad = 3.0;
+            // Vertical menu: one function per row, width auto-fitted to the
+            // longest label so nothing gets truncated, generous row spacing so
+            // buttons don't feel crammed together.
+            let pad = 6.0;
+            let row_gap = 4.0;
+            let font_size = 12.0;
+            let row_h = font_size + 10.0; // text + vertical breathing room
             let count = self.toolbar.actions.len().max(1) as f32;
-            let tb_w = btn_w * count + gap * (count - 1.0) + pad * 2.0 + btn_h + gap; // +close btn
-            let tb_h = btn_h + pad * 2.0;
+
+            // Auto-fit width: measure the longest label (approx char width ≈ 0.6 * size)
+            // and add left padding + right slack. This avoids both truncation and
+            // a window that's too wide for short labels.
+            let max_label_chars = self
+                .toolbar
+                .actions
+                .iter()
+                .map(|(_, l)| l.chars().count())
+                .max()
+                .unwrap_or(8) as f32;
+            let btn_w = (max_label_chars * font_size * 0.65 + 16.0).max(80.0);
+            let tb_w = btn_w + pad * 2.0;
+            let tb_h = row_h * count + row_gap * (count - 1.0) + pad * 2.0;
 
             // Screen size in physical pixels (same space as the mouse hook).
             let (screen_w_phys, screen_h_phys) = crate::platform::get_primary_monitor_size();
@@ -562,29 +679,23 @@ impl eframe::App for MyApp {
             egui::CentralPanel::default()
                 .frame(frame)
                 .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.y = row_gap;
+                    ui.vertical(|ui| {
                         for (id, label) in self.toolbar.actions.clone() {
-                            // Shorten label to fit the compact button (truncate to ~7 chars).
-                            let short = if label.chars().count() > 8 {
-                                let mut s: String = label.chars().take(7).collect();
-                                s.push('…');
-                                s
-                            } else {
-                                label.clone()
-                            };
-
-                            if ui.add_sized(
-                                [btn_w, btn_h],
-                                egui::Button::new(
-                                    egui::RichText::new(&short)
+                            // Each row: full-width SelectableLabel with left
+                            // alignment (SelectableLabel is left-aligned by
+                            // default when given the full available width).
+                            let resp = ui.add_sized(
+                                [btn_w, row_h],
+                                egui::SelectableLabel::new(
+                                    false,
+                                    egui::RichText::new(&label)
                                         .color(TEXT_COLOR)
-                                        .size(11.0),
-                                )
-                                .fill(crate::ui::theme::SURFACE_2)
-                                .stroke(egui::Stroke::new(STROKE_HAIRLINE, BORDER))
-                                .rounding(egui::Rounding::same(RADIUS_SM)),
-                            ).clicked() {
+                                        .size(font_size),
+                                ),
+                            );
+
+                            if resp.clicked() {
                                 info!("Toolbar button clicked: {}", id);
                                 let trigger_text = self.toolbar.text.clone();
                                 if let Some(action) = crate::core::actions::Action::from_name(&id) {
@@ -595,19 +706,6 @@ impl eframe::App for MyApp {
                                 }
                                 self.toolbar.visible = false;
                             }
-                        }
-
-                        // Tiny close button on the right
-                        if ui.add_sized(
-                            [btn_h, btn_h],
-                            egui::Button::new(
-                                egui::RichText::new("✕").color(DANGER_TEXT).size(10.0),
-                            )
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::new(STROKE_HAIRLINE, BORDER))
-                            .rounding(egui::Rounding::same(RADIUS_SM)),
-                        ).clicked() {
-                            self.toolbar.visible = false;
                         }
                     });
                 });
@@ -713,9 +811,38 @@ impl eframe::App for MyApp {
             return;
         }
 
-        // NOTE: Focus-based auto-close removed - window stays open until user explicitly closes it
-        // or a new action is triggered (which cancels the old one and shows new UI)
-        
+        // Click-outside-to-close: detect a left-button click (press that was
+        // down last frame and is released this frame) whose release point lies
+        // outside the result window. egui only sees clicks inside its own
+        // window, so we poll the global OS mouse state and compare against the
+        // window's outer rect in screen coordinates.
+        //
+        // Only active for the terminal result states (not while Waiting —
+        // that shows the small status bar, handled above — and not while the
+        // selection toolbar is up, which has its own leave-to-hide logic).
+        let down_now = crate::platform::is_left_mouse_down();
+        let is_click = self.was_left_mouse_down && !down_now;
+        self.was_left_mouse_down = down_now;
+        if is_click {
+            let inside_result = ctx.input(|i| i.viewport().outer_rect)
+                .map(|r| {
+                    if let Some((mx, my)) = crate::platform::get_cursor_pos() {
+                        // outer_rect is in physical pixels, same as the cursor.
+                        r.contains(egui::pos2(mx as f32, my as f32))
+                    } else {
+                        // Can't read cursor — assume inside to avoid a
+                        // spurious close on the very first frame.
+                        true
+                    }
+                })
+                .unwrap_or(true);
+            if !inside_result {
+                info!("Click outside result window detected — closing result window");
+                self.visible = false;
+                self.state = AppState::Idle;
+            }
+        }
+
         // Result window - show full size popup for Finished/Error/Incomplete.
         // Move window to right side, proper size.
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition([RESULT_X, RESULT_Y].into()));
@@ -885,4 +1012,60 @@ impl eframe::App for MyApp {
             self.state = AppState::Idle;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Platform helpers for opening logs / running custom commands.
+// ---------------------------------------------------------------------------
+
+/// Look up an executable by name in `$PATH`. Returns its full path if found.
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(name);
+            let candidate = if cfg!(windows) {
+                // On Windows, also try with .exe extension.
+                if candidate.extension().is_none() {
+                    let with_exe = candidate.with_extension("exe");
+                    if with_exe.is_file() {
+                        return Some(with_exe);
+                    }
+                }
+                candidate
+            } else {
+                candidate
+            };
+            if candidate.is_file() {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// Find an available terminal emulator on Linux/macOS.
+/// Returns the binary name if one is found in `$PATH`.
+fn find_terminal_emulator() -> Option<&'static str> {
+    const TERMINALS: &[&str] = &[
+        "x-terminal-emulator", // Debian / Ubuntu
+        "gnome-terminal",
+        "konsole",
+        "xfce4-terminal",
+        "alacritty",
+        "kitty",
+        "terminator",
+        "tilix",
+        "xterm", // ubiquitous fallback
+        "wezterm",
+        "foot", // Wayland
+        // macOS uses Terminal.app via `open`, handled separately.
+    ];
+
+    for term in TERMINALS {
+        if which(term).is_some() {
+            return Some(term);
+        }
+    }
+    None
 }

@@ -488,6 +488,19 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
     get_mouse_pos()
 }
 
+/// Returns `true` if the left mouse button is currently held down.
+///
+/// Used by the result-window "click outside to close" logic: egui only
+/// sees clicks inside its own window, so to detect a click landing anywhere
+/// else on the screen we poll the global button state each frame and compare
+/// the cursor position against the result window's rect.
+pub fn is_left_mouse_down() -> bool {
+    // VK_LBUTTON = 0x01. GetAsyncKeyState returns a short whose high bit is
+    // set when the key is currently down.
+    const VK_LBUTTON: i32 = 0x01;
+    unsafe { GetAsyncKeyState(VK_LBUTTON) < 0 }
+}
+
 /// Primary monitor dimensions in physical screen pixels.
 /// Matches the coordinate space of `get_cursor_pos()` and `MSLLHOOKSTRUCT.pt`
 /// — both use physical pixels, making screen-edge clamping consistent even on

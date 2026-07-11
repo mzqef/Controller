@@ -5,7 +5,7 @@
 1. Install Rust (https://rustup.rs)
 2. Clone the repository:
    ```bash
-   git clone https://github.com/your-org/IntelliBoard.git
+   git clone https://github.com/mzqef/IntelliBoard.git
    cd IntelliBoard
    ```
 3. Build in release mode:
@@ -33,8 +33,10 @@
 
 ## Example .env
 ```
-ALIYUN_API_KEY=sk-your-actual-key-here
+API_KEY=sk-your-actual-key-here
 ```
+
+See `.env.example` in the repository root for a ready-to-copy template.
 
 ## License
 Distributed under the GPLv3. See LICENSE for details.

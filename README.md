@@ -59,7 +59,7 @@ IntelliBoard is a Rust desktop agent that enhances clipboard workflows using LLM
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/IntelliBoard.git
+git clone https://github.com/mzqef/IntelliBoard.git
 cd IntelliBoard
 
 # Build in release mode

@@ -10,10 +10,26 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-/// Stub for Unix/macOS - focus by window title not implemented
+/// Focus a window by its title using `wmctrl -a <title>` on X11.
+/// Returns `false` if wmctrl is unavailable or the window was not found.
+/// On Wayland, wmctrl is typically non-functional — returns `false`.
 pub fn focus_window_by_title(title: &str) -> bool {
-    warn!("focus_window_by_title not implemented on this platform: {}", title);
-    false
+    let result = std::process::Command::new("wmctrl")
+        .args(&["-a", title])
+        .status();
+    match result {
+        Ok(status) if status.success() => {
+            debug!("Focused existing window via wmctrl: {}", title);
+            true
+        }
+        _ => {
+            // Fallback: try xdotool search by name
+            let result = std::process::Command::new("xdotool")
+                .args(&["search", "--name", title, "windowactivate"])
+                .status();
+            matches!(result, Ok(s) if s.success())
+        }
+    }
 }
 
 /// Stub for Unix/macOS - IME composition detection not implemented
@@ -26,31 +42,157 @@ pub fn is_ime_composing() -> bool {
 /// Stub for Unix/macOS - caret/cursor position for selection popup.
 /// Returns a fixed position; full implementation would use X11/Wayland APIs.
 pub fn get_selection_popup_pos() -> (i32, i32) {
+    // On X11 we can try xdotool / xsel for cursor; on Wayland this is restricted.
+    // Prefer mouse cursor so the toolbar appears near the user's pointer.
+    if let Some((x, y)) = get_cursor_pos() {
+        return (x + 12, y + 14);
+    }
     (300, 300)
 }
 
-/// Stub for Unix/macOS - selection-detection mouse hook.
-/// rdev::grab already captures mouse events on some platforms, but wiring the
-/// drag-selection detection here is left as a TODO. The toolbar can still be
-/// triggered via the hotkey path.
-pub fn init_selection_mouse_hook(_tx: tokio::sync::mpsc::Sender<crate::core::events::AppEvent>) -> Result<Arc<()>, String> {
-    warn!("init_selection_mouse_hook not implemented on Unix/macOS");
+/// Selection-detection mouse hook on Unix using rdev::grab.
+///
+/// rdev::grab can capture mouse events on X11 (requires `/dev/uinput` write
+/// access, or on some setups the X11 record extension). When a drag selection
+/// ends (left button released after movement), we emit
+/// `AppEvent::SelectionAt { x, y }`.
+///
+/// On Wayland or systems without grab permission, this will log an error and
+/// return `Ok` with a dummy handle — the toolbar can still be triggered via
+/// the clipboard-copy path (which is the primary trigger today).
+pub fn init_selection_mouse_hook(
+    tx: tokio::sync::mpsc::Sender<crate::core::events::AppEvent>,
+) -> Result<Arc<()>, String> {
+    use std::sync::atomic::AtomicBool;
+    static DRAGGING: AtomicBool = AtomicBool::new(false);
+    static LAST_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static LAST_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    std::thread::spawn(move || {
+        let callback = move |event: Event| -> Option<Event> {
+            match event.event_type {
+                EventType::ButtonPress(button) => {
+                    if matches!(button, rdev::MouseButton::Left) {
+                        DRAGGING.store(false, Ordering::Relaxed);
+                    }
+                    Some(event)
+                }
+                EventType::MouseMove { x, y } => {
+                    // Any movement with left button (tracked separately) marks a drag.
+                    // rdev doesn't give us simultaneous button state on move events
+                    // on all platforms, so we just record the latest position.
+                    LAST_X.store(x as i32, Ordering::Relaxed);
+                    LAST_Y.store(y as i32, Ordering::Relaxed);
+                    DRAGGING.store(true, Ordering::Relaxed);
+                    Some(event)
+                }
+                EventType::ButtonRelease(button) => {
+                    if matches!(button, rdev::MouseButton::Left) {
+                        let was_drag = DRAGGING.swap(false, Ordering::Relaxed);
+                        if was_drag {
+                            let x = LAST_X.load(Ordering::Relaxed);
+                            let y = LAST_Y.load(Ordering::Relaxed);
+                            let _ = tx.try_send(crate::core::events::AppEvent::SelectionAt {
+                                x,
+                                y,
+                            });
+                        }
+                    }
+                    Some(event)
+                }
+                _ => Some(event),
+            }
+        };
+
+        if let Err(e) = rdev::grab(callback) {
+            error!("Failed to grab mouse events for selection detection: {:?}", e);
+        }
+    });
+
     Ok(Arc::new(()))
 }
 
-/// Stub for Unix/macOS - synthesized Ctrl+C for grabbing a selection.
-/// A real implementation would use xdotool / CGEvent. No-op here.
-pub fn send_copy_shortcut() {}
-
-/// Stub for Unix/macOS - global cursor position. Returns `None`; full
-/// implementation would query X11 / Wayland.
-pub fn get_cursor_pos() -> Option<(i32, i32)> {
-    None
+/// Synthesize Ctrl+C for grabbing a selection on Linux/macOS.
+/// Uses `xdotool key ctrl+c` on X11. On Wayland this is typically not
+/// possible from another process, so we fall back to a no-op (the user
+/// must already have copied the text for the toolbar to appear).
+pub fn send_copy_shortcut() {
+    // xdotool is the standard X11 automation tool.
+    let result = std::process::Command::new("xdotool")
+        .args(&["key", "ctrl+c"])
+        .spawn();
+    if let Err(e) = result {
+        log::debug!("send_copy_shortcut: xdotool not available ({})", e);
+    }
 }
 
-/// Stub for Unix/macOS - primary monitor size. Returns a fallback; full
-/// implementation would query X11 / Wayland.
+/// Global cursor position via `xdotool getmouselocation` on X11.
+/// Returns `None` on Wayland or when xdotool is unavailable.
+pub fn get_cursor_pos() -> Option<(i32, i32)> {
+    let output = std::process::Command::new("xdotool")
+        .args(&["getmouselocation", "--shell"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut x: Option<i32> = None;
+    let mut y: Option<i32> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("X=") {
+            x = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("Y=") {
+            y = rest.trim().parse().ok();
+        }
+    }
+    match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    }
+}
+
+/// Global left-mouse-button state via `xdotool getmouselocation --shell`.
+/// Parses the `BUTTON` field; returns `false` when xdotool is unavailable
+/// (e.g. Wayland), which disables "click outside to close" for the result
+/// window — the window can still be closed via its close button or Escape.
+pub fn is_left_mouse_down() -> bool {
+    let output = match std::process::Command::new("xdotool")
+        .args(&["getmouselocation", "--shell"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // xdotool --shell emits BUTTON=<n> only when a button is held.
+    // Button 1 = left. Absence of BUTTON or BUTTON=0 means no button held.
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("BUTTON=") {
+            let val: i32 = rest.trim().parse().unwrap_or(0);
+            return val == 1;
+        }
+    }
+    false
+}
+
+/// Primary monitor size via `xdotool getdisplaygeometry` on X11.
+/// Returns a sensible fallback (1920×1080) on Wayland or failure.
 pub fn get_primary_monitor_size() -> (i32, i32) {
+    let output = match std::process::Command::new("xdotool")
+        .args(&["getdisplaygeometry"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return (1920, 1080),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = stdout.split_whitespace().collect();
+    if parts.len() >= 2 {
+        let w = parts[0].parse().unwrap_or(1920);
+        let h = parts[1].parse().unwrap_or(1080);
+        return (w, h);
+    }
     (1920, 1080)
 }
 

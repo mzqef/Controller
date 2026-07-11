@@ -29,7 +29,6 @@ tao = "0.28" # Needed for event loop if we weren't using eframe, but eframe uses
 # We might need to be careful about event loop conflicts, but tray-icon is designed to be independent.
 image = "0.24"
 toml = "0.9.10"
-clipboard-master = "4.0.0"
 dotenv = "0.15.0"
 dirs = "4"
 uuid = { version = "1.6", features = ["v4", "serde"] }
@@ -43,6 +42,7 @@ eventsource-stream = "0.2"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "shellapi", "libloaderapi", "imm"] }
 windows-service = "0.5"
+clipboard-master = "4.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
@@ -53,5 +53,5 @@ default = ["system-clipboard"]
 system-clipboard = []
 debug-mode = []
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

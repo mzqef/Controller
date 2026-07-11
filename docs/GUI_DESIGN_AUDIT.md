@@ -1,9 +1,11 @@
 # IntelliBoard GUI Design Audit
 
 > **Purpose**: Single-file reference for audit review and external AI rapid assessment.  
-> **Version**: 2026-07-03 r2 (design-system refactor: token scales, elevation surfaces, soft accents, frame builders)  
+> **Version**: 2026-07-04 r3 (floating action toolbar, event catalog refresh)  
 > **UI Framework**: `eframe` / `egui` (immediate-mode GUI, Rust)  
 > **Aesthetic**: "Japan 2046" — Cyber-Japonism / Neon Cyberpunk  
+
+> **2026-07-04 r3 change summary** — adds the **Floating Action Toolbar** (§6.6): a compact pill-shaped button strip that pops up near the mouse release point after a text selection. The toolbar offers one-click AI functions without a hotkey. Also refreshes the event catalog (§11) with `ShowActionToolbar`, `SetClipboard`, and `SelectionAt`; updates the Functions Config default position from (1000,130) to (80,80); documents `IntelliBoard_DIAG_TOOLBAR`; and corrects the off-screen idle state from (10000,10000) to 1×1 px.
 
 > **2026-07-03 r2 change summary** — the GUI was audited as "lacking texture, uncoordinated sizing". The fix introduces a single **design-token system** in `src/ui/theme.rs` (spacing / radius / type / stroke / elevation scales, soft-accent variants, and reusable frame builders). All four UI surfaces (`src/ui.rs`, `src/bin/functions_config_ui.rs`, `src/ui/memory_graph.rs`, plus the shared `apply_theme`) now draw exclusively from these tokens. Raw neon is reserved for emphasis; surfaces, borders and fills use softened/elevated variants so the UI reads as layered depth rather than flat neon-on-black.
 
@@ -253,20 +255,21 @@ The application uses a **multi-process** architecture:
 
 | Window                        | Process | Size (W×H)     | Default Position   | Spawn Trigger                |
 |-------------------------------|---------|-----------------|--------------------|------------------------------|
-| Main Result Popup             | Main    | 500×700         | (1350, 250)        | `ProcessingStarted` event    |
-| Processing Indicator Bar      | Main    | 280×50          | Bottom-center      | `Waiting` state              |
+| Main Result Popup             | Main    | 520×700         | (1350, 250)        | `ProcessingStarted` event    |
+| Processing Indicator Bar      | Main    | 300×56          | Bottom-center      | `Waiting` state              |
+| Floating Action Toolbar       | Main    | dynamic (≤80px) | Near mouse release  | `ShowActionToolbar` event    |
 | Memory Graph                  | Child   | 1000×800        | (900, 200)         | Tray left-click / menu item  |
-| Functions Configuration       | Child   | 1120×760 *(r2)* | (1000, 130) *(r2)* | Tray menu "Configuration"    |
+| Functions Configuration       | Child   | 1120×760 *(r3)* | (80, 80) *(r3)*    | Tray menu "Configuration"    |
 | Hotkey Configuration (legacy) | Child   | 550×450         | (1350, 300)        | Legacy standalone launcher   |
 
 ### 5.2 Window Flags
 
-| Flag                 | Main Result | Memory Graph | Functions Config | Processing Bar |
-|----------------------|-------------|--------------|------------------|----------------|
-| Resizable            | No (fixed)  | Yes          | Yes              | No             |
-| Always on top        | No          | No           | No               | No (but small) |
-| `windows_subsystem`  | `"windows"` | `"windows"`  | `"windows"`      | Same window as main |
-| Focus-on-show        | Yes (env override: `IntelliBoard_NO_UI_FOCUS`) | No explicit | No explicit | No explicit |
+| Flag                 | Main Result | Floating Toolbar | Memory Graph | Functions Config | Processing Bar |
+|----------------------|-------------|------------------|--------------|------------------|----------------|
+| Resizable            | No (fixed)  | No (fixed)       | Yes          | Yes              | No             |
+| Always on top        | No          | No               | No           | No               | No (but small) |
+| `windows_subsystem`  | `"windows"` | `"windows"`      | `"windows"`  | `"windows"`      | Same window as main |
+| Focus-on-show        | Yes (env override: `IntelliBoard_NO_UI_FOCUS`) | No | No explicit | No explicit | No explicit |
 
 ### 5.3 Process Manager
 
@@ -392,9 +395,69 @@ Child windows are managed by `ProcessManager`:
 ### 6.5 Hidden / Off-screen State
 
 When `visible == false`:
-- Window moved to (10000, 10000) — off-screen.
+- Window shrunk to 1×1 px *(r3: was moved off-screen at 10000,10000 — caused OS clamp artifacts on reposition)*.
 - Repaint interval: 500ms (low-CPU idle).
 - Empty `CentralPanel` with no frame.
+
+### 6.6 Floating Action Toolbar *(r3 — new)*
+
+A compact pill-shaped button strip that pops up near the mouse release point
+after a text selection. Offers one-click AI functions without a hotkey.
+Defined in `src/ui.rs` as `ToolbarState`.
+
+**Trigger**: `ShowActionToolbar { text, x, y }` UiEvent, fired by the clipboard
+listener when the user releases the mouse after a potential text selection.
+
+**Geometry** *(all values in logical px)*:
+
+| Property       | Value                                              |
+|----------------|----------------------------------------------------|
+| Button size    | 56×26 px                                           |
+| Button gap     | 2 px                                               |
+| Inner padding  | 3 px (all sides)                                   |
+| Close button   | 26×26 px (square, matches button height)           |
+| Label font     | 11 px (not tokenised — compact space constraint)   |
+| Label truncate | 8 chars → first 7 + `…`                            |
+| Window rounding| `RADIUS_MD` (6 px)                                 |
+| Fill           | `SURFACE_3` (`#181B24`)                            |
+| Border         | `STROKE_HAIRLINE` × `BORDER` (`#303644`)           |
+
+**Positioning**:
+- Anchor point = `(x + 8, y + 14)` physical px from mouse release.
+- Clamped to screen bounds (4 px margin).
+- Physical → logical conversion via `ctx.input(|i| i.pixels_per_point())` so
+the window lands at the correct position on HiDPI displays.
+- Window rect recorded in physical pixels for the keep-zone test.
+
+**Keep-zone / hide behaviour**:
+
+| Parameter            | Value  | Meaning                                             |
+|----------------------|--------|-----------------------------------------------------|
+| `TOOLBAR_TIMEOUT_SECS`| 12    | Hard timeout — hides even if cursor stays inside    |
+| `ANCHOR_GRACE_PX`    | 36    | Radius around mouse release that counts as "inside" |
+| `LEAVE_GRACE_MS`     | 120   | Debounce before hiding on cursor leave (anti-flicker)|
+
+- Toolbar stays open while the cursor hovers the toolbar rect **or** lingers
+within the anchor grace circle.
+- The moment the cursor leaves both zones for >120ms, the toolbar hides.
+- Hard timeout at 12s prevents an infinite-linger state.
+
+**Interaction**:
+- Click a function button → writes the selection text to clipboard via
+`AppEvent::SetClipboard`, then fires `AppEvent::TriggerAction(action)`.
+- Click ✕ close button → hides toolbar.
+- Press Escape → hides toolbar.
+- Only renders when `AppState::Idle` (never during active processing).
+
+**Layout**:
+```
+┌──────┬──────┬──────┬──────┬────┐
+│ Frmt │ Trns │ Expl │ Img… │ ✕  │
+└──────┴──────┴──────┴──────┴────┘
+```
+Buttons: `SURFACE_2` fill, `STROKE_HAIRLINE` × `BORDER` border, `RADIUS_SM`
+rounding. Labels: `TEXT_COLOR`, 11 px. Close button: transparent fill,
+`DANGER_TEXT` ✕.
 
 ---
 
@@ -542,6 +605,7 @@ Defined in `src/bin/functions_config_ui.rs`.
 
 ### 8.1 Layout (Three-Panel)
 
+> *(r3)*: default position moved from (1000,130) → **(80, 80)** so the window fits fully on a 1920-wide display (was landing partly off-screen at the old coordinate).
 > *(r2)*: window 1080×720 → **1120×760**; nav panel 184px → **208px**; section card radius 8 → `RADIUS_LG` (10); page title 22px → `TEXT_2XL` (24); nav items now `CTRL_H_LG` (36px) sized buttons. All fills/borders now come from the shared elevation tokens (`SURFACE_1`/`SURFACE_2`/`BORDER`), no longer hardcoded `#0B0D13`.
 
 ```
@@ -693,23 +757,26 @@ Defined in `src/bin/hotkey_config_ui.rs` and `src/ui/hotkey_config.rs`.
 
 ### 11.1 UI Event Types (`UiEvent`)
 
-| Variant                | Payload        | Source                | Effect                                 |
-|------------------------|----------------|-----------------------|----------------------------------------|
-| `ProcessingStarted`    | `String` (label)| `ActionHandler`       | Show processing bar, state→Waiting     |
-| `ShowResult`           | `(orig, text)` | `ActionHandler`       | Show result, state→Finished            |
-| `StreamUpdate`         | `String`       | `LlmClient`           | Append to text, state→Streaming        |
-| `StreamEnd`            | `bool`         | `LlmClient`           | Finalize typewriter, state→Finished/Incomplete |
-| `StreamError`          | `String`       | `LlmClient` / handler | Show error, state→Error               |
-| `ShowMemoryGraph`      | —              | Tray / hotkey         | Spawn Memory Graph child process       |
-| `ShowHotkeyConfig`     | —              | Tray menu             | Spawn Functions Config child process   |
-| `Quit`                 | —              | Control server        | Close window                           |
+| Variant                | Payload                  | Source                | Effect                                 |
+|------------------------|--------------------------|-----------------------|----------------------------------------|
+| `ProcessingStarted`    | `(String, String)` (label, original_text) | `ActionHandler` | Show processing bar, state→Waiting |
+| `ShowResult`           | `(String, String)` (original, result) | `ActionHandler` | Show result, state→Finished     |
+| `StreamUpdate`         | `String`                 | `LlmClient`           | Append to text, state→Streaming        |
+| `StreamEnd`            | `bool`                   | `LlmClient`           | Finalize typewriter, state→Finished/Incomplete |
+| `StreamError`          | `String`                 | `LlmClient` / handler | Show error, state→Error               |
+| `ShowMemoryGraph`      | —                        | Tray / hotkey         | Spawn Memory Graph child process       |
+| `ShowHotkeyConfig`     | —                        | Tray menu             | Spawn Functions Config child process   |
+| `ShowActionToolbar`    | `{ text, x, y }` *(r3)* | Clipboard listener    | Pop up floating action toolbar near mouse release |
+| `Quit`                 | —                        | Control server        | Close window                           |
 
 ### 11.2 App Event Types (`AppEvent`)
 
 | Variant            | Payload            | Source                  | Effect                              |
 |--------------------|--------------------|-------------------------|-------------------------------------|
-| `TriggerAction`    | `Action`           | Hotkey system           | Execute AI action on clipboard      |
+| `TriggerAction`    | `Action`           | Hotkey system / toolbar | Execute AI action on clipboard      |
 | `UserQuery`        | `String`           | Main UI input           | Send user text to LLM               |
+| `SetClipboard`     | `String` *(r3)*    | Floating toolbar        | Overwrite system clipboard before triggering action |
+| `SelectionAt`      | `{ x, y }` *(r3)*  | Global mouse hook       | Grab current selection, pop up toolbar near (x, y) |
 | `ToggleProcessing` | `bool`             | Tray checkbox           | Enable/disable clipboard processing |
 | `ToggleLocalMode`  | `bool`             | Tray checkbox           | Force local LLM mode                |
 | `Cancel`           | —                  | UI / stop button        | Cancel in-flight request            |
@@ -809,6 +876,7 @@ layer on top of the same base dark theme everywhere.
 | `IntelliBoard_DIAG_UI`      | Log extra UI debug info (ProcessingStarted, ShowResult, focus suppression) |
 | `IntelliBoard_NO_UI_FOCUS`  | Suppress `ViewportCommand::Focus` on result show|
 | `IntelliBoard_DIAG_CLIPBOARD`| Log extra clipboard debug info                  |
+| `IntelliBoard_DIAG_TOOLBAR` *(r3)* | Log toolbar positioning math (anchor phys px, screen size, ppp, final logical position) |
 
 ---
 
@@ -877,4 +945,4 @@ texture and coordinated sizing.
 
 ---
 
-*End of GUI Design Audit. All values confirmed against source as of 2026-07-03 (r2).*
+*End of GUI Design Audit. All values confirmed against source as of 2026-07-04 (r3).*

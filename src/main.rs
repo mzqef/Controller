@@ -299,38 +299,12 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
-
-    // Selection-detection mouse hook: fires AppEvent::SelectionAt when the user
-    // finishes a drag selection. The toolbar pops up at that point. Disabled by
-    // the IntelliBoard_NO_SELECTION_HOOK env var for users who prefer hotkeys only.
-    let _selection_hook = if std::env::var_os("IntelliBoard_NO_SELECTION_HOOK").is_none() {
-        match IntelliBoard::platform::init_selection_mouse_hook(tx.clone()) {
-            Ok(h) => {
-                info!("Selection-detection mouse hook installed");
-                Some(h)
-            }
-            Err(e) => {
-                log::warn!("Failed to install selection mouse hook: {}", e);
-                None
-            }
-        }
-    } else {
-        info!("Selection-detection hook disabled by IntelliBoard_NO_SELECTION_HOOK");
-        None
-    };
-
-    // Guard set while we synthesize a Ctrl+C to grab the active selection, so
-    // the clipboard listener knows to ignore the resulting clipboard write
-    // (it is a programmatic side-effect, not a user copy).
-    let injecting_copy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     
     // Clone shared configs for async block
     let shared_actions_inner = shared_actions.clone();
     let shared_hotkeys_inner = shared_hotkeys.clone();
     let hotkey_system_inner = hotkey_system.clone();
     let cancel_flag_inner = cancel_flag.clone();
-    let injecting_copy_inner = injecting_copy.clone();
-    let ui_tx_inner = ui_tx.clone();
 
     // Main Tokio Loop
     std::thread::spawn(move || {
@@ -364,16 +338,6 @@ fn main() -> anyhow::Result<()> {
                             *guard = std::time::Instant::now();
                         }
                         
-                        // If we synthesized the copy ourselves (to grab a selection),
-                        // skip memory storage and the toolbar trigger — the SelectionAt
-                        // handler already takes care of showing the toolbar.
-                        if injecting_copy_inner.load(std::sync::atomic::Ordering::Relaxed) {
-                            if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
-                                log::debug!("[diag] skipping injected copy");
-                            }
-                            continue;
-                        }
-                        
                         // Store clipboard content to memory (skip programmatic writes)
                         // with IME-aware debouncing to handle Pinyin/other IME composition
                         if let Ok(text) = clipboard.get_text() {
@@ -382,25 +346,81 @@ fn main() -> anyhow::Result<()> {
                                     log::debug!("[diag] ignored programmatic clipboard write");
                                 }
                             } else {
-                                // Check IME composition state (Windows-specific)
-                                #[cfg(windows)]
-                                let ime_composing = IntelliBoard::platform::is_ime_composing();
-                                #[cfg(not(windows))]
-                                let ime_composing = false;
-                                
-                                // Apply time+content debouncing for IME compatibility
-                                if let Some(wait_ms) = clipboard.should_debounce(&text, ime_composing) {
-                                    if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
-                                        log::debug!("[diag] debouncing clipboard for {}ms (ime={})", wait_ms, ime_composing);
+                                // Apply time+content debouncing for IME compatibility.
+                                //
+                                // BUG FIX (selection toolbar never showed up): the previous
+                                // implementation did `sleep(...); continue;` after a debounce
+                                // hit. `continue` returns to the `select!`, which only re-enters
+                                // this branch when ANOTHER clipboard event arrives. On Windows
+                                // `clipboard_master` fires exactly once per copy, so the debounced
+                                // content was never re-checked and the floating toolbar / memory
+                                // write never fired for that copy.
+                                //
+                                // Now we loop locally: sleep, re-read the clipboard, and re-evaluate
+                                // `should_debounce` until the content is stable (or it changes and
+                                // we re-stabilize on the new content). We also bail out if the
+                                // clipboard text drifts away from what we're waiting on, so a
+                                // mid-debounce copy of different content resets cleanly via the
+                                // outer loop's next event.
+                                let mut current_text = text.clone();
+                                loop {
+                                    #[cfg(windows)]
+                                    let ime_composing = IntelliBoard::platform::is_ime_composing();
+                                    #[cfg(not(windows))]
+                                    let ime_composing = false;
+
+                                    match clipboard.should_debounce(&current_text, ime_composing) {
+                                        None => break, // stable — fall through to processing
+                                        Some(wait_ms) => {
+                                            if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
+                                                log::debug!("[diag] debouncing clipboard for {}ms (ime={})", wait_ms, ime_composing);
+                                            }
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms.min(50))).await;
+                                            // Re-read: if the clipboard changed to something else,
+                                            // abandon this stabilization and let the next clipboard
+                                            // event handle the new content.
+                                            match clipboard.get_text() {
+                                                Ok(t) if t == current_text => continue,
+                                                Ok(_) => {
+                                                    if std::env::var_os("IntelliBoard_DIAG_CLIPBOARD").is_some() {
+                                                        log::debug!("[diag] clipboard content changed mid-debounce; aborting this stabilization");
+                                                    }
+                                                    // The outer loop will pick it up on the next event.
+                                                    // We break out without processing so we don't fire
+                                                    // the toolbar on stale content.
+                                                    // Skip the post-loop processing for this event.
+                                                    // The fresh clipboard event will deliver it.
+                                                    current_text.clear();
+                                                    break;
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
                                     }
-                                    // Schedule a delayed re-check by sleeping briefly and continuing
-                                    // The next clipboard event or timeout will re-trigger processing
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms.min(50))).await;
+                                }
+
+                                if current_text.is_empty() {
+                                    // Aborted mid-debounce (content changed underneath us).
+                                    // The new content will arrive as its own clipboard event.
                                     continue;
                                 }
-                                
-                                // Content is stable - process it
+
+                                // Content is stable - process it.
+                                // Use the stabilized snapshot so we don't race with another copy.
+                                let text = current_text;
                                 clipboard.mark_processed(&text);
+                                
+                                // Pop up the floating action toolbar near the selection
+                                // (only if it's meaningful text; skip very short / whitespace)
+                                let trimmed = text.trim();
+                                if trimmed.len() >= 2 && !trimmed.chars().all(|c| c.is_whitespace()) {
+                                    let (px, py) = IntelliBoard::platform::get_selection_popup_pos();
+                                    let _ = ui_tx.send(UiEvent::ShowActionToolbar {
+                                        text: text.clone(),
+                                        x: px,
+                                        y: py,
+                                    });
+                                }
                                 
                                 if let Err(e) = graph_tx.send(MemoryEvent::AddClipboard(text)).await {
                                     error!("Failed to enqueue clipboard memory event: {}", e);
@@ -457,57 +477,6 @@ fn main() -> anyhow::Result<()> {
                                     error!("SetClipboard failed: {}", e);
                                 }
                             },
-                            AppEvent::SelectionAt { x, y } => {
-                                // The user just finished dragging a selection. We grab the
-                                // selected text by synthesizing a Ctrl+C in the focused
-                                // window, then pop the toolbar near the release point.
-                                // Run on a background task so the event loop stays responsive.
-                                let cb = clipboard.clone();
-                                let injecting = injecting_copy_inner.clone();
-                                let ui_tx2 = ui_tx_inner.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    // Remember what was on the clipboard so we can restore it.
-                                    let backup = cb.get_text().ok();
-
-                                    // Signal the clipboard listener to ignore the next write(s).
-                                    injecting.store(true, std::sync::atomic::Ordering::SeqCst);
-
-                                    IntelliBoard::platform::send_copy_shortcut();
-                                    // Give the target app time to push the selection to the
-                                    // clipboard. 120ms is empirically safe for Office/browsers.
-                                    std::thread::sleep(std::time::Duration::from_millis(120));
-
-                                    let selected = cb.get_text().ok();
-                                    injecting.store(false, std::sync::atomic::Ordering::SeqCst);
-
-                                    // Decide whether to show the toolbar.
-                                    let meaningful = match selected.as_deref() {
-                                        Some(t) => {
-                                            let trimmed = t.trim();
-                                            trimmed.len() >= 1
-                                                && !trimmed.chars().all(|c| c.is_whitespace())
-                                        }
-                                        None => false,
-                                    };
-
-                                    if meaningful {
-                                        if let Some(t) = selected {
-                                            let _ = ui_tx2.send(UiEvent::ShowActionToolbar {
-                                                text: t,
-                                                x,
-                                                y,
-                                            });
-                                        }
-                                    }
-
-                                    // Best-effort restore of the previous clipboard so our
-                                    // selection-grab doesn't clobber the user's clipboard.
-                                    if let Some(prev) = backup {
-                                        // Mark programmatic so it doesn't get recorded again.
-                                        let _ = cb.set_text_programmatic(&prev);
-                                    }
-                                });
-                            },
                              AppEvent::Cancel => {
                                 info!("Cancel requested - stopping in-flight request");
                                 cancel_flag_inner.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -525,6 +494,14 @@ fn main() -> anyhow::Result<()> {
                             }
                             AppEvent::ShowHotkeyConfig => {
                                 let _ = ui_tx_for_events.send(UiEvent::ShowHotkeyConfig);
+                            }
+                            // SelectionAt is reserved for a future mouse-hook-driven
+                            // toolbar trigger (see AppEvent::SelectionAt docs). The
+                            // toolbar is currently driven by the clipboard-change
+                            // path below, so we just log here to keep the match
+                            // exhaustive and forward-compatible.
+                            AppEvent::SelectionAt { x, y } => {
+                                debug!("SelectionAt received ({}, {}) — no mouse-hook handler wired up; toolbar is driven by clipboard change", x, y);
                             }
                             AppEvent::ConfigChanged(change) => {
                                 info!("Config file changed: {:?}", change);
@@ -570,19 +547,24 @@ fn main() -> anyhow::Result<()> {
     });
 
     // Start UI
-    let viewport = {
-        let builder = eframe::egui::ViewportBuilder::default()
-            .with_visible(false) // Start hidden
-            .with_taskbar(false)
-            .with_decorations(false)
-            .with_transparent(true);
-
-        if std::env::var_os("IntelliBoard_NO_TOPMOST").is_some() {
-            builder
-        } else {
-            builder.with_always_on_top()
-        }
-    };
+    //
+    // Topmost policy: we do NOT enable global always-on-top here. The viewport
+    // is reused for three different surfaces (status bar, result window,
+    // selection toolbar) and they have different Z-ordering needs:
+    //   - status bar / toolbar : AlwaysOnTop (must overlay whatever the user
+    //                            is doing until the result arrives).
+    //   - result window        : Normal level, brought forward with Focus()
+    //                            so it appears above the focused window at the
+    //                            moment of completion but lets the user click
+    //                            other apps above it afterwards.
+    //
+    // WindowLevel is dispatched each frame from `update()` via
+    // `ViewportCommand::WindowLevel`.
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_visible(false) // Start hidden
+        .with_taskbar(false)
+        .with_decorations(false)
+        .with_transparent(true);
 
     let options = eframe::NativeOptions {
         viewport,

@@ -9,9 +9,14 @@ pub enum AppEvent {
     /// toolbar to ensure the action handler picks up exactly the text that was
     /// selected when the toolbar appeared.
     SetClipboard(String),
-    /// The user just released the mouse button after a potential text
-    /// selection at screen coordinates (x, y). The receiver should grab the
-    /// current selection and pop up the action toolbar near this point.
+    /// Reserved hook for a future mouse-driven toolbar trigger.
+    ///
+    /// IMPORTANT — current toolbar semantics: the floating action toolbar is
+    /// triggered EXCLUSIVELY by a clipboard copy event (see the `cb_rx.recv()`
+    /// branch in `main.rs`), NOT by mouse-selection release. There is no
+    /// "select text → toolbar appears" path today; only "copy text → toolbar
+    /// appears". This variant is kept for a possible future mouse-hook path
+    /// but currently has no sender and is only handled with a debug log.
     SelectionAt { x: i32, y: i32 },
     ToggleProcessing(bool),
     ToggleLocalMode(bool),
