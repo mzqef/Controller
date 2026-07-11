@@ -11,6 +11,7 @@ IntelliBoard is a Rust desktop agent that enhances clipboard workflows using LLM
 - [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Features](#features)
+- [Platform-Specific Notes](#platform-specific-notes) — Windows / Linux / Wayland / macOS differences
 - [Configuration Guide](#configuration-guide)
 - [Architecture](#architecture)
 - [Developer Guide](#developer-guide)
@@ -46,9 +47,10 @@ IntelliBoard is a Rust desktop agent that enhances clipboard workflows using LLM
 
 | Platform | Requirements |
 |----------|--------------|
-| **Windows** | Windows 10/11, MSVC toolchain |
-| **Linux** | libxdo-dev, libxcb-*, libgtk-3-dev |
-| **macOS** | Xcode Command Line Tools |
+| **Windows** | Windows 10/11, MSVC toolchain (full feature parity) |
+| **Linux (X11)** | Rust + system libs (see below), `xdotool` + `wmctrl` recommended |
+| **Linux (Wayland)** | Same as X11; some global-input features fall back (see [Platform Notes](#platform-specific-notes)) |
+| **macOS** | Xcode Command Line Tools (experimental — same fallbacks as Linux) |
 
 ### Prerequisites
 
@@ -72,12 +74,54 @@ cargo build --release
 
 ### Linux Dependencies
 
-```bash
-# Ubuntu/Debian
-sudo apt install libxdo-dev libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
+IntelliBoard needs X11 development libraries (for `egui`/`rdev`/`arboard`) plus a few runtime tools used for cursor positioning, window focus, and synthesized copy shortcuts.
 
-# Fedora
-sudo dnf install libxdo-devel libxcb-devel gtk3-devel
+**Runtime tools** (used by `src/platform/unix.rs`):
+
+| Tool | Used for | Fallback if missing |
+|------|----------|---------------------|
+| `xdotool` | Cursor position, monitor size, `Ctrl+C` injection, left-button state | Fixed defaults / no-op |
+| `wmctrl` | Focus child windows (Memory Graph / Config UI) by title | `xdotool search` fallback, then no-op |
+
+**Build + runtime libraries:**
+
+```bash
+# Ubuntu / Debian
+sudo apt install libxcb-randr0-dev libxcb-xfixes0-dev libxcb-shape0-dev \
+    libx11-dev libxkbcommon-dev libssl-dev pkg-config \
+    xdotool wmctrl
+
+# Fedora / RHEL
+sudo dnf install xcb-util-devel libX11-devel libxkbcommon-devel openssl-devel \
+    pkg-config xdotool wmctrl
+
+# Arch Linux
+sudo pacman -S libxcb libx11 libxkbcommon openssl pkgconf xdotool wmctrl
+```
+
+**Global hotkeys on Linux (`rdev::grab`):**
+
+`rdev::grab` intercepts global key events. On Linux this requires write access to `/dev/uinput`. Without it, **hotkeys won't fire**, but the floating toolbar (triggered by clipboard copy) still works.
+
+```bash
+# Grant /dev/uinput access (log out + back in afterwards)
+sudo usermod -aG input $USER
+```
+
+**System tray:**
+
+`tray-icon` requires a StatusNotifierWatcher (AppIndicator) compatible tray.
+
+| Desktop | Status |
+|---------|--------|
+| KDE Plasma | ✅ Built-in |
+| XFCE / Cinnamon / MATE | ✅ Built-in |
+| GNOME | ⚠️ Needs `gnome-shell-extension-appindicator` |
+
+```bash
+# Ubuntu / GNOME
+sudo apt install gnome-shell-extension-appindicator
+# Then enable the extension in GNOME Extensions / Tweaks
 ```
 
 ### Environment Setup
@@ -102,13 +146,86 @@ export API_KEY="sk-your-api-key-here"
 ./target/release/IntelliBoard --log
 ```
 
+### Linux Desktop Integration
+
+IntelliBoard ships a `.desktop` file for application menu + autostart integration.
+
+```bash
+# 1. Install to application menu
+mkdir -p ~/.local/share/applications
+cp scripts/linux/intelliboard.desktop ~/.local/share/applications/
+update-desktop-database ~/.local/share/applications/
+
+# 2. (Optional) Autostart on login
+mkdir -p ~/.config/autostart
+cp scripts/linux/intelliboard.desktop ~/.config/autostart/
+```
+
+Edit the `Exec=` and `Icon=` paths in the `.desktop` file to point to your install location (default: `/opt/intelliboard/`).
+
+A convenience build script (`scripts/linux/build.sh`) checks dependencies, builds, and stages a deployable bundle into `target/release/dist/`:
+
+```bash
+chmod +x scripts/linux/build.sh
+./scripts/linux/build.sh
+```
+
+---
+
+## Platform-Specific Notes
+
+IntelliBoard is developed and tested on Windows. Linux support is built-in via best-effort compatibility; some features behave differently depending on the display server.
+
+### Feature Matrix
+
+| Feature | Windows | Linux (X11) | Linux (Wayland) | macOS |
+|---------|:-------:|:-----------:|:---------------:|:-----:|
+| Clipboard change detection | Event-driven (`clipboard-master`) | Polling (300ms hash) | Polling | Polling |
+| Global hotkeys | `SetWindowsHookEx` (non-consuming) | `rdev::grab` (needs `/dev/uinput`) | ❌ Not available | `rdev::grab` |
+| Copy-gated hotkey blocking | ✅ Native | ⚠️ Basic (Ctrl-only) | ❌ | ⚠️ Basic |
+| Floating toolbar (after copy) | ✅ | ✅ | ✅ | ✅ |
+| Cursor / selection position | `GetCursorPos` + caret via `GetGUIThreadInfo` | `xdotool` | Fixed default | Fixed default |
+| Window focus (child UIs) | `FindWindowW` + `SetForegroundWindow` | `wmctrl` / `xdotool` | ❌ | ❌ |
+| Monitor size | `GetSystemMetrics` | `xdotool getdisplaygeometry` | Fixed 1920×1080 | Fixed 1920×1080 |
+| IME composition detection | Stub (debounce-based) | Stub (debounce-based) | Stub | Stub |
+| Dark-mode native menus | ✅ `uxtheme.dll` | N/A | N/A | N/A |
+
+### Architecture: Platform Split
+
+Platform-specific code lives in two parallel modules, selected at compile time:
+
+```
+src/platform/
+├── mod.rs       ← cfg(windows) / cfg(not(windows)) switch
+├── windows.rs   ← Win32 hooks (WH_KEYBOARD_LL, WH_MOUSE_LL, SendInput)
+└── unix.rs      ← Linux/macOS: rdev::grab + xdotool/wmctrl shelling
+```
+
+The clipboard listener (`src/core/clipboard_listener.rs`) also splits:
+
+- **Windows** — `clipboard-master` crate (event-driven, fires once per copy).
+- **Linux/macOS** — polling thread that hashes clipboard contents every 300ms and emits an event on change. This is because X11/Wayland do not provide clipboard-change signals.
+
+### Wayland Limitations
+
+Wayland's security model isolates clients from each other. On a Wayland session:
+
+- ❌ Global hotkeys via `rdev::grab` do **not** work (input grab is blocked).
+- ❌ `xdotool` / `wmctrl` are non-functional (they're X11 tools).
+- ❌ Cursor position falls back to a fixed `(300, 300)` default.
+- ❌ Window focus for child UIs (Memory Graph, Config) is a no-op.
+- ✅ Clipboard polling still works (via `arboard` / `wl-clipboard`).
+- ✅ The floating toolbar (triggered by a copy) still appears.
+
+If you need full functionality, run IntelliBoard under **XWayland** or a native **X11** session.
+
 ---
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| **Low-level keyboard hook** | Uses `SetWindowsHookEx(WH_KEYBOARD_LL)` on Windows — only intercepts when you have recently copied text |
+| **Global hotkeys** | Windows: `SetWindowsHookEx(WH_KEYBOARD_LL)`; Linux: `rdev::grab` — only intercepts when you have recently copied text |
 | **IME-aware debouncing** | Time + content stability checks prevent false triggers during Pinyin/Japanese IME composition |
 | **Per-action configuration** | Each AI function can use different models, prompts, and API endpoints |
 | **Remote/local fallback** | Automatically switches to local LLM when remote API is unreachable |
@@ -258,7 +375,9 @@ For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITE
 | File | Purpose |
 |------|---------|
 | `src/main.rs` | App entry, single-instance guard, tray setup, runtime bridge |
-| `src/platform/windows.rs` | Low-level keyboard hook with copy-gated blocking |
+| `src/platform/windows.rs` | Windows: low-level keyboard/mouse hooks, SendInput, cursor/caret APIs |
+| `src/platform/unix.rs` | Linux/macOS: `rdev::grab` hotkeys + `xdotool`/`wmctrl` shelling for cursor/window APIs |
+| `src/core/clipboard_listener.rs` | Clipboard change detection (Windows: event-driven; Linux/macOS: polling) |
 | `src/core/actions.rs` | High-level action handling and LLM calls |
 | `src/core/detector.rs` | Regex/heuristics for text classification |
 | `src/api/client.rs` | LLM client with remote/local fallback, streaming |
@@ -334,6 +453,18 @@ tail -50 $(ls -t logs/*.log | head -1)
 | **API errors** | Check your API key in `.env` or config; verify network connectivity |
 | **IME conflicts** | IntelliBoard uses debouncing to avoid IME interference; wait for composition to complete |
 | **Multiple instances** | IntelliBoard uses a single-instance guard on TCP port 18432 |
+
+### Linux-Specific Issues
+
+| Issue | Solution |
+|-------|----------|
+| **Hotkeys don't fire at all** | `rdev::grab` needs `/dev/uinput` write access — run `sudo usermod -aG input $USER`, then log out and back in |
+| **No tray icon on GNOME** | Install `gnome-shell-extension-appindicator` and enable it in GNOME Extensions |
+| **Tray icon but no left-click action** | Wayland tray implementations vary; try an X11/XWayland session |
+| **Toolbar appears at wrong position** | `xdotool` not found or running under Wayland — install `xdotool`, or use X11 session |
+| **Child windows (Config/Graph) don't focus** | Install `wmctrl`, or it's running under Wayland (focus not supported) |
+| **Clipboard changes not detected** | Verify `DISPLAY` is set (X11) or that a Wayland clipboard bridge is active |
+| **`arboard` init fails on startup** | No X11/Wayland session detected — run IntelliBoard from within a GUI session |
 
 ### Checking Logs
 
