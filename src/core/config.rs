@@ -157,6 +157,10 @@ pub fn save_hotkeys_config(config: &HotkeysConfig) -> Result<()> {
 pub struct ActionLocalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
+    /// API key for local LLM servers that require authentication (e.g. LM Studio).
+    /// Supports `${ENV_VAR}` syntax (e.g. `${LOCAL_API_KEY}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,6 +378,7 @@ impl Default for ActionsConfig {
                 timeout_ms: Some(60000),
                 local: Some(ActionLocalConfig {
                     api_url: Some("http://127.0.0.1:52625/v1/chat/completions".to_string()),
+                    api_key: Some("${LOCAL_API_KEY}".to_string()),
                     model: Some("gemma4-it:e2b".to_string()),
                     prompt: None,
                     extra: HashMap::new(),
@@ -506,10 +511,42 @@ pub fn load_actions_config() -> Result<ActionsConfig> {
         
         if let Some(user_config) = load_actions_from_file(&user_dir) {
             info!("Applying user actions override from {}", user_dir.display());
-            // Merge user config into default:
-            // - User defaults override repo defaults
-            if user_config.defaults.api_url.is_some() {
-                config.defaults = user_config.defaults;
+            // Merge user config into default field-by-field.
+            // This ensures that changing ONLY the local API URL (or any single
+            // default) in the Configuration UI actually takes effect —
+            // previously the merge was gated on `api_url.is_some()` alone.
+            if let Some(ref url) = user_config.defaults.api_url {
+                config.defaults.api_url = Some(url.clone());
+            }
+            if let Some(ref key) = user_config.defaults.api_key {
+                config.defaults.api_key = Some(key.clone());
+            }
+            if let Some(ref model) = user_config.defaults.model {
+                config.defaults.model = Some(model.clone());
+            }
+            if user_config.defaults.temperature.is_some() {
+                config.defaults.temperature = user_config.defaults.temperature;
+            }
+            if user_config.defaults.timeout_ms.is_some() {
+                config.defaults.timeout_ms = user_config.defaults.timeout_ms;
+            }
+            if let Some(ref user_local) = user_config.defaults.local {
+                let local = config.defaults.local.get_or_insert_with(ActionLocalConfig::default);
+                if let Some(ref url) = user_local.api_url {
+                    local.api_url = Some(url.clone());
+                }
+                if let Some(ref key) = user_local.api_key {
+                    local.api_key = Some(key.clone());
+                }
+                if let Some(ref model) = user_local.model {
+                    local.model = Some(model.clone());
+                }
+                if let Some(ref prompt) = user_local.prompt {
+                    local.prompt = Some(prompt.clone());
+                }
+                if !user_local.extra.is_empty() {
+                    local.extra = user_local.extra.clone();
+                }
             }
             config.force_local = user_config.force_local;
             if user_config.export_path.is_some() {

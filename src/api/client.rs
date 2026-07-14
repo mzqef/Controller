@@ -271,6 +271,12 @@ impl LlmClient {
                 .or_else(|| local_defaults.and_then(|l| l.model.clone()))
                 .unwrap_or_else(|| "local-model".to_string());
             
+            // Resolve local API key: action → defaults → env var (LOCAL_API_KEY)
+            let api_key = action_local.and_then(|l| l.api_key.clone())
+                .or_else(|| local_defaults.and_then(|l| l.api_key.clone()))
+                .or_else(|| std::env::var("LOCAL_API_KEY").ok())
+                .map(|k| Self::expand_env(&k));
+            
             let prompt = action_local.and_then(|l| l.prompt.clone())
                 .or_else(|| action.remote.as_ref().and_then(|r| r.prompt.clone()));
             
@@ -280,7 +286,7 @@ impl LlmClient {
             // Collect extra params from local config
             let extra = action_local.map(|l| l.extra.clone()).unwrap_or_default();
             
-            Ok((url, model, None, prompt, temperature, None, extra))
+            Ok((url, model, api_key, prompt, temperature, None, extra))
         } else {
             // Remote config: merge action.remote with defaults
             let action_remote = action.remote.as_ref();

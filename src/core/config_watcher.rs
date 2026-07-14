@@ -8,6 +8,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 use log::{info, error, debug};
 
+// Used to resolve the per-user config override directory
+use dirs;
+
 /// Message sent when config files change
 #[derive(Debug, Clone)]
 pub enum ConfigChange {
@@ -16,14 +19,20 @@ pub enum ConfigChange {
     Unknown(String),
 }
 
-/// Watches config directory for file changes with debouncing
+/// Watches config directories for file changes with debouncing.
+///
+/// Monitors both the project-local `config/` directory and the per-user
+/// override directory (`dirs::config_dir()/IntelliBoard/`) so that saves
+/// from the Configuration UI (which writes to the user directory) trigger
+/// a hot-reload in the main process.
 pub struct ConfigWatcher {
     _watcher: RecommendedWatcher,
     rx: Receiver<ConfigChange>,
 }
 
 impl ConfigWatcher {
-    /// Create a new config watcher monitoring the given directory
+    /// Create a new config watcher monitoring the project config directory
+    /// AND the user override directory (if one exists).
     pub fn new<P: AsRef<Path>>(config_dir: P) -> Result<Self, notify::Error> {
         let (tx, rx) = channel();
         
@@ -47,14 +56,29 @@ impl ConfigWatcher {
             Config::default(),
         )?;
         
+        // Watch the project-local config directory
         watcher.watch(config_dir.as_ref(), RecursiveMode::NonRecursive)?;
         info!("Config watcher started for {:?}", config_dir.as_ref());
+        
+        // Also watch the per-user override directory so changes made by the
+        // Configuration UI (functions_config_ui) are picked up immediately.
+        if let Some(mut user_dir) = dirs::config_dir() {
+            user_dir.push("IntelliBoard");
+            // Create the directory if it doesn't exist yet (first save will create it)
+            if !user_dir.exists() {
+                let _ = std::fs::create_dir_all(&user_dir);
+            }
+            if user_dir.exists() {
+                watcher.watch(&user_dir, RecursiveMode::NonRecursive)?;
+                info!("Config watcher also watching user config: {:?}", user_dir);
+            }
+        }
         
         Ok(Self {
             _watcher: watcher,
             rx,
         })
-    }
+    }·
     
     /// Try to receive a config change notification (non-blocking)
     pub fn try_recv(&self) -> Option<ConfigChange> {

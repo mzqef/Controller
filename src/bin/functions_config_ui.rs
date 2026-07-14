@@ -706,6 +706,12 @@ impl FunctionsConfigApp {
                         local.model = Self::optional_text(&model);
                         changed = true;
                     }
+
+                    let mut key = local.api_key.clone().unwrap_or_default();
+                    if Self::text_row(ui, "API Key", &mut key, "${LOCAL_API_KEY}", true) {
+                        local.api_key = Self::optional_text(&key);
+                        changed = true;
+                    }
                 }
             });
         }
