@@ -207,11 +207,13 @@ impl eframe::App for MyApp {
                 let enabled = handler.enable_item.is_checked();
                 info!("Tray Enable toggled: {}", enabled);
                 
-                // Update Icon
-                let new_icon = if enabled {
-                    crate::load_tray_icon_active()
-                } else {
+                // Update Icon: consider both enabled and local-mode state.
+                let new_icon = if !enabled {
                     crate::load_tray_icon_inactive()
+                } else if handler.local_mode_item.is_checked() {
+                    crate::load_tray_icon_local()
+                } else {
+                    crate::load_tray_icon_active()
                 };
                 let _ = handler.icon.set_icon(Some(new_icon));
 
@@ -219,6 +221,18 @@ impl eframe::App for MyApp {
             } else if event.id == handler.local_mode_id {
                 let use_local = handler.local_mode_item.is_checked();
                 info!("Tray Local Mode toggled: {}", use_local);
+
+                // Update Icon: red when local mode is on, active when off
+                // (only if processing is enabled; otherwise stay greyscale)
+                if handler.enable_item.is_checked() {
+                    let new_icon = if use_local {
+                        crate::load_tray_icon_local()
+                    } else {
+                        crate::load_tray_icon_active()
+                    };
+                    let _ = handler.icon.set_icon(Some(new_icon));
+                }
+
                 let _ = handler.tx.try_send(AppEvent::ToggleLocalMode(use_local));
             } else if event.id == handler.show_log_id {
                 info!("Tray Show Log clicked");

@@ -330,6 +330,18 @@ pub fn apply_greyscale(rgba: &mut [u8]) {
     }
 }
 
+/// Apply red tint to RGBA data (for local model mode).
+/// Preserves luminance structure so the icon shape remains readable.
+pub fn apply_red_tint(rgba: &mut [u8]) {
+    for chunk in rgba.chunks_exact_mut(4) {
+        let lum = (chunk[0] as f32 * 0.299 + chunk[1] as f32 * 0.587 + chunk[2] as f32 * 0.114) as u8;
+        chunk[0] = lum;
+        chunk[1] = (lum as f32 * 0.15) as u8;
+        chunk[2] = (lum as f32 * 0.10) as u8;
+        // Keep alpha unchanged
+    }
+}
+
 /// Create tray icon from RGBA data
 pub fn rgba_to_tray_icon(rgba: Vec<u8>, width: u32, height: u32) -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, width, height).expect("Failed to create tray icon")
@@ -360,6 +372,13 @@ pub fn load_tray_icon_active() -> tray_icon::Icon {
 pub fn load_tray_icon_inactive() -> tray_icon::Icon {
     let (mut rgba, w, h) = load_icon_rgba();
     apply_greyscale(&mut rgba);
+    rgba_to_tray_icon(rgba, w, h)
+}
+
+/// Load local-model (red) tray icon
+pub fn load_tray_icon_local() -> tray_icon::Icon {
+    let (mut rgba, w, h) = load_icon_rgba();
+    apply_red_tint(&mut rgba);
     rgba_to_tray_icon(rgba, w, h)
 }
 

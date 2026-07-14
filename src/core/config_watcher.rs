@@ -78,7 +78,7 @@ impl ConfigWatcher {
             _watcher: watcher,
             rx,
         })
-    }·
+    }
     
     /// Try to receive a config change notification (non-blocking)
     pub fn try_recv(&self) -> Option<ConfigChange> {
