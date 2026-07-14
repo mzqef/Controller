@@ -21,4 +21,4 @@ pub mod startup;
 pub mod platform;
 
 // Re-export icon utilities for convenient access
-pub use ui::theme::{load_tray_icon_active, load_tray_icon_inactive, load_egui_icon};
+pub use ui::theme::{load_tray_icon_active, load_tray_icon_inactive, load_tray_icon_local, load_egui_icon};
